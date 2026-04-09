@@ -206,8 +206,36 @@ def webhook():
         msg = event["message"]
         
         # ── 이미지 메시지 처리 🆕 ──
-        if msg["type"] == "image":
-            handle_image_message(reply_token, user_id, msg)
+def handle_image_message(reply_token, user_id, msg):
+    message_id = msg["id"]
+    
+    image_bytes = get_line_image(message_id)
+    if not image_bytes:
+        reply_message(reply_token, [{
+            "type": "text",
+            "text": "画像の取得に失敗しました。もう一度送ってください🙏"
+        }])
+        return
+    
+    # "분석 중" 메시지 보내지 말고 바로 분석
+    result = full_analysis(image_bytes, ref_name="SOFT")
+    
+    if "error" in result:
+        reply_message(reply_token, [{
+            "type": "text",
+            "text": "分析エラーです。もう一度お送りください🙏"
+        }])
+        return
+    
+    detected = detect_pattern_type(result["student_zones"])
+    if detected != "SOFT":
+        result = full_analysis(image_bytes, ref_name=detected)
+    
+    # 이미지 없이 텍스트만 reply_token으로 전송
+    reply_message(reply_token, [{
+        "type": "text",
+        "text": result["message_ja"],
+    }])
         
         # ── 텍스트 메시지 처리 (기존 로직) ──
         elif msg["type"] == "text":
