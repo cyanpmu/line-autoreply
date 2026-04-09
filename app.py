@@ -22,6 +22,10 @@ LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 
+# 답장하지 않을 사람 (선생님, 보조쌤)
+# Render 환경변수: IGNORE_USER_IDS=Uxxxxx,Uyyyyy,Uzzzzz
+IGNORE_USER_IDS = set(filter(None, os.environ.get("IGNORE_USER_IDS", "").split(",")))
+
 response_cache = {}
 CACHE_TTL = 3600
 
@@ -141,6 +145,10 @@ def webhook():
         source_type = event["source"]["type"]
         msg = event["message"]
 
+        # 선생님/보조쌤 메시지는 무시 (답장 안 함)
+        if user_id in IGNORE_USER_IDS:
+            continue
+
         # ── 그룹/룸 → 자동 번역 + 이미지 분석 ──
         if source_type in ("group", "room"):
             group_id = event["source"].get("groupId") or event["source"].get("roomId", "")
@@ -228,6 +236,11 @@ def handle_image(reply_token, user_id, msg):
 
 
 def handle_text(reply_token, user_id, text):
+    # User ID 확인 커맨드
+    if text.strip().lower() in ("myid", "id", "내아이디"):
+        reply_message(reply_token, [{"type": "text", "text": f"あなたのUser ID:\n{user_id}"}])
+        return
+
     cache_key = hashlib.md5(text.encode()).hexdigest()
     if cache_key in response_cache:
         cached = response_cache[cache_key]
