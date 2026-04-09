@@ -118,6 +118,32 @@ def get_image_from_line(message_id):
     return None
 
 
+def get_user_profile(user_id):
+    """LINE 유저 프로필(이름) 가져오기"""
+    try:
+        r = httpx.get(
+            f"https://api.line.me/v2/bot/profile/{user_id}",
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return r.json().get("displayName", "")
+    except:
+        pass
+    return ""
+
+
+def add_name_prefix(answer, user_name, question_summary=""):
+    """답변 앞에 학생 이름 + 질문 요약 추가"""
+    if not user_name:
+        return answer
+    if question_summary:
+        prefix = f"{user_name}さん、{question_summary}についてお答えします😊\n\n"
+    else:
+        prefix = f"{user_name}さん😊\n\n"
+    return prefix + answer
+
+
 # ── Claude API ──
 def ask_claude(question):
     """텍스트 질문 → Claude 답변 (캐시 있으면 캐시)"""
@@ -214,17 +240,22 @@ def handle_text(reply_token, text, user_name=""):
     """텍스트 메시지 처리"""
     log(f"  💬 텍스트: \"{text[:50]}\" (from {user_name})")
 
+    # 질문 요약 (첫 20자)
+    q_summary = text[:20].replace("\n", " ")
+    if len(text) > 20:
+        q_summary += "..."
+
     # 1단계: Q&A 매칭 (무료)
     answer, score = get_best_reply(text, REPLY_LANG)
     if answer and score >= MIN_MATCH_SCORE:
         log(f"  🎯 Q&A 매칭! (점수: {score})")
-        reply_to_line(reply_token, answer)
+        reply_to_line(reply_token, add_name_prefix(answer, user_name, q_summary))
         return
 
     # 2단계: Claude API (유료, 캐시)
     answer = ask_claude(text)
     if answer:
-        reply_to_line(reply_token, answer)
+        reply_to_line(reply_token, add_name_prefix(answer, user_name, q_summary))
         return
 
     # 3단계: 둘 다 안 되면
@@ -237,14 +268,14 @@ def handle_image(reply_token, message_id, user_name=""):
 
     image_bytes = get_image_from_line(message_id)
     if not image_bytes:
-        reply_to_line(reply_token, "画像を受け取りましたが、読み込めませんでした。もう一度送っていただけますか？🙇")
+        reply_to_line(reply_token, add_name_prefix("画像を受け取りましたが、読み込めませんでした。もう一度送っていただけますか？🙇", user_name))
         return
 
     feedback = analyze_image_with_claude(image_bytes)
     if feedback:
-        reply_to_line(reply_token, feedback)
+        reply_to_line(reply_token, add_name_prefix(feedback, user_name, "課題の添削"))
     else:
-        reply_to_line(reply_token, "画像を確認しました！先生に詳しいフィードバックをお願いしますね。少々お待ちください🙇")
+        reply_to_line(reply_token, add_name_prefix("画像を確認しました！先生に詳しいフィードバックをお願いしますね。少々お待ちください🙇", user_name))
 
 
 # ── Flask 라우트 ──
@@ -281,9 +312,9 @@ def webhook():
         msg = event["message"]
         msg_type = msg.get("type")
 
-        # 보낸 사람 이름 (가능하면)
-        user_id = event.get("source", {}).get("userId", "unknown")
-        user_name = user_id[:8]
+        # 보낸 사람 이름 가져오기 (LINE 프로필)
+        user_id = event.get("source", {}).get("userId", "")
+        user_name = get_user_profile(user_id) if user_id else ""
 
         log(f"\n{'='*40}")
         log(f"📩 새 메시지 (type: {msg_type})")
