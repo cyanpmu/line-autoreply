@@ -1,3 +1,4 @@
-flask==3.1.1
-gunicorn==23.0.0
-httpx==0.28.1
+httpx>=0.24.0
+pyautogui>=0.9.54
+pyperclip>=1.8.2
+Pillow>=10.0.0

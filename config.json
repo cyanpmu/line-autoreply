@@ -1,0 +1,7 @@
+{
+  "claude_api_key": "",
+  "check_interval": 3,
+  "auto_send": true,
+  "min_match_score": 8,
+  "cooldown_sec": 10
+}
