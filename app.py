@@ -22,9 +22,9 @@ LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 
-# 답장하지 않을 사람 (선생님, 보조쌤)
-# Render 환경변수: IGNORE_USER_IDS=Uxxxxx,Uyyyyy,Uzzzzz
-IGNORE_USER_IDS = set(filter(None, os.environ.get("IGNORE_USER_IDS", "").split(",")))
+# 무시할 사람 닉네임 (선생님, 보조쌤)
+# Render 환경변수: IGNORE_NAMES=KIE,ゆき,C
+IGNORE_NAMES = set(filter(None, os.environ.get("IGNORE_NAMES", "").split(",")))
 
 response_cache = {}
 CACHE_TTL = 3600
@@ -145,11 +145,7 @@ def webhook():
         source_type = event["source"]["type"]
         msg = event["message"]
 
-        # 선생님/보조쌤 메시지는 무시 (답장 안 함)
-        if user_id in IGNORE_USER_IDS:
-            continue
-
-        # ── 그룹/룸 → 자동 번역 + 이미지 분석 ──
+        # ── 그룹/룸 → 번역만 (Q&A 답장 안 함) ──
         if source_type in ("group", "room"):
             group_id = event["source"].get("groupId") or event["source"].get("roomId", "")
             if msg["type"] == "text":
@@ -157,11 +153,14 @@ def webhook():
             elif msg["type"] == "image":
                 handle_group_image(reply_token, group_id, user_id, msg)
 
-        # ── 1:1 → Q&A + 이미지 분석 ──
+        # ── 1:1 → 일본어만 응답 (한국어=선생님이니까 무시) ──
         elif source_type == "user":
             if msg["type"] == "image":
                 handle_image(reply_token, user_id, msg)
             elif msg["type"] == "text":
+                # 한국어면 선생님/보조쌤 → 무시
+                if detect_language(msg["text"]) == "ko":
+                    continue
                 handle_text(reply_token, user_id, msg["text"])
 
     return "OK"
@@ -175,17 +174,24 @@ def handle_group_text(reply_token, group_id, user_id, text):
     if len(text.strip()) < 3:
         return
 
+    # 발신자 이름 확인
+    sender_name = get_group_member_name(group_id, user_id)
+    is_staff = sender_name in IGNORE_NAMES
     lang = detect_language(text)
 
     if lang == "ko":
+        # 한국어 = 선생님 → 일본어로 번역 (학생이 읽을 수 있게)
         translated = translate_text(text, "ko", "ja")
         if translated:
             reply_message(reply_token, [{"type": "text", "text": f"🇯🇵 {translated}"}])
 
-    elif lang == "ja":
+    elif lang == "ja" and not is_staff:
+        # 일본어 + 학생(스태프 아님) → 한국어로 번역 (선생님이 읽을 수 있게)
         translated = translate_text(text, "ja", "ko")
         if translated:
             reply_message(reply_token, [{"type": "text", "text": f"🇰🇷 {translated}"}])
+
+    # 일본어 + 보조쌤(KIE, ゆき) → 무시 (번역 필요 없음)
 
 
 def handle_group_image(reply_token, group_id, user_id, msg):
