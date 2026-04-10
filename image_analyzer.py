@@ -1,240 +1,379 @@
 """
-파우더브로우 LINE 자동답장 서버 v5
-- 1:1 채팅: Q&A 매칭 + Claude API 폴백 + 이미지 분석
-- 그룹 채팅: 양방향 자동 번역 + 이미지 분석
+파우더브로우 이미지 분석기 v3
+- 일본어 메시지 출력
+- 눈썹 오감지 방지 강화
+- 선생님 기준 40점 캘리브레이션
+- 친절한 톤
 """
 
-import os
+import cv2
+import numpy as np
 import json
-import hashlib
-import hmac
-import base64
+import os
 import time
-import re
-import httpx
-from flask import Flask, request, abort
-from qa_engine import find_best_qa_match, get_system_prompt
-from image_analyzer import analyze_image_bytes, format_line_message
+import tempfile
 
-app = Flask(__name__)
+TEACHER_REF = {
+    "profile_80": [1, 28, 40, 35, 14],
+    "gradient_range": 40,
+}
 
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
-IGNORE_NAMES = set(filter(None, os.environ.get("IGNORE_NAMES", "").split(",")))
-
-response_cache = {}
-CACHE_TTL = 3600
-
-
-def verify_signature(body, signature):
-    hash_val = hmac.new(LINE_CHANNEL_SECRET.encode(), body, hashlib.sha256).digest()
-    return signature == base64.b64encode(hash_val).decode()
-
-
-def reply_message(reply_token, messages):
-    try:
-        httpx.post("https://api.line.me/v2/bot/message/reply",
-            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"},
-            json={"replyToken": reply_token, "messages": messages[:5]}, timeout=30)
-    except Exception as e:
-        print(f"Reply error: {e}")
+PATTERN_REFS = {
+    "SOFT": {
+        "darkness": [121, 128, 136, 129, 116],
+        "density":  [26.1, 53.0, 67.4, 67.5, 40.0],
+    },
+    "NATURAL": {
+        "darkness": [120, 122, 123, 121, 122],
+        "density":  [25.1, 54.0, 57.4, 50.6, 35.2],
+    },
+    "MIX": {
+        "darkness": [125, 127, 129, 128, 126],
+        "density":  [32.1, 63.7, 62.8, 53.3, 39.9],
+    },
+}
 
 
-def get_line_image(message_id):
-    try:
-        resp = httpx.get(f"https://api-data.line.me/v2/bot/message/{message_id}/content",
-            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}, timeout=30)
-        if resp.status_code == 200:
-            return resp.content
-    except Exception as e:
-        print(f"Image download error: {e}")
-    return None
+def detect_brows(image):
+    """눈썹 영역 감지 — 오감지 방지 강화"""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    h, w = gray.shape
 
+    bg_value = np.median(gray)
+    threshold = bg_value * 0.72
+    _, binary = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY_INV)
 
-def get_user_name(user_id):
-    try:
-        resp = httpx.get(f"https://api.line.me/v2/bot/profile/{user_id}",
-            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}, timeout=10)
-        if resp.status_code == 200:
-            return resp.json().get("displayName", "")
-    except:
-        pass
-    return ""
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 7))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 3)))
 
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-def get_group_member_name(group_id, user_id):
-    try:
-        resp = httpx.get(f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}/profile",
-            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}, timeout=10)
-        if resp.status_code == 200:
-            return resp.json().get("displayName", "")
-    except:
-        pass
-    return ""
+    brows = []
+    img_area = h * w
+    min_area = img_area * 0.008
+    max_area = img_area * 0.35
 
-
-def detect_language(text):
-    korean = len(re.findall(r'[\uac00-\ud7af\u3131-\u3163\u1100-\u11ff]', text))
-    japanese = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', text))
-    if korean > 0 and korean >= japanese:
-        return "ko"
-    elif japanese > 0:
-        return "ja"
-    return "unknown"
-
-
-def translate_text(text, from_lang, to_lang):
-    if not CLAUDE_API_KEY:
-        return None
-    instructions = {
-        ("ko", "ja"): "韓国語を自然な日本語に翻訳。パウダーブロウ専門用語はそのまま。翻訳だけ出力。",
-        ("ja", "ko"): "日本語を自然な韓国語に翻訳。パウダーブロウ専門用語はそのまま。翻訳だけ出力。",
-    }
-    instruction = instructions.get((from_lang, to_lang))
-    if not instruction:
-        return None
-    try:
-        resp = httpx.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 500,
-                  "messages": [{"role": "user", "content": f"{instruction}\n\n{text}"}]}, timeout=20)
-        if resp.status_code == 200:
-            return resp.json()["content"][0]["text"]
-    except Exception as e:
-        print(f"Translate error: {e}")
-    return None
-
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    body = request.get_data()
-    signature = request.headers.get("X-Line-Signature", "")
-    if LINE_CHANNEL_SECRET and not verify_signature(body, signature):
-        abort(403)
-
-    data = json.loads(body)
-    for event in data.get("events", []):
-        if event["type"] != "message":
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area or area > max_area:
             continue
 
-        reply_token = event["replyToken"]
-        user_id = event["source"].get("userId", "")
-        source_type = event["source"]["type"]
-        msg = event["message"]
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        aspect = bw / bh if bh > 0 else 0
 
-        if source_type in ("group", "room"):
-            group_id = event["source"].get("groupId") or event["source"].get("roomId", "")
-            if msg["type"] == "text":
-                handle_group_text(reply_token, group_id, user_id, msg["text"])
-            elif msg["type"] == "image":
-                handle_group_image(reply_token, msg)
-        elif source_type == "user":
-            if msg["type"] == "image":
-                handle_image(reply_token, msg)
-            elif msg["type"] == "text":
-                if detect_language(msg["text"]) == "ko":
-                    continue
-                handle_text(reply_token, user_id, msg["text"])
+        # 눈썹 형태 필터: 가로가 세로보다 2~7배 길어야 함
+        if aspect < 2.0 or aspect > 7.0:
+            continue
 
-    return "OK"
+        # 이미지 가장자리 (상단 10%, 하단 15%) 제외 — 커팅매트/텍스트
+        if y < h * 0.10 or (y + bh) > h * 0.85:
+            continue
 
+        # 너무 작은 높이 제외
+        if bh < h * 0.05:
+            continue
 
-def handle_group_text(reply_token, group_id, user_id, text):
-    if len(text.strip()) < 3:
-        return
-    sender_name = get_group_member_name(group_id, user_id)
-    is_staff = sender_name in IGNORE_NAMES
-    lang = detect_language(text)
+        brows.append({"contour": cnt, "bbox": (x, y, bw, bh), "area": area})
 
-    if lang == "ko":
-        translated = translate_text(text, "ko", "ja")
-        if translated:
-            reply_message(reply_token, [{"type": "text", "text": f"🇯🇵 {translated}"}])
-    elif lang == "ja" and not is_staff:
-        translated = translate_text(text, "ja", "ko")
-        if translated:
-            reply_message(reply_token, [{"type": "text", "text": f"🇰🇷 {translated}"}])
+    # 면적 기준 상위 1~3개만 (가장 큰 것이 진짜 눈썹)
+    brows.sort(key=lambda b: b["area"], reverse=True)
+
+    # 가장 큰 눈썹 대비 30% 미만인 것은 제외
+    if brows:
+        max_area_found = brows[0]["area"]
+        brows = [b for b in brows if b["area"] > max_area_found * 0.3]
+
+    brows.sort(key=lambda b: b["bbox"][0])
+    return brows[:3]  # 최대 3개
 
 
-def handle_group_image(reply_token, msg):
-    image_bytes = get_line_image(msg["id"])
-    if not image_bytes:
-        return
-    result = analyze_image_bytes(image_bytes)
-    if "error" in result:
-        return
-    ja_msg = format_line_message(result)
-    ko_summary = f"🇰🇷 [분석] {result['score']}점"
-    reply_message(reply_token, [
-        {"type": "text", "text": ja_msg},
-        {"type": "text", "text": ko_summary},
-    ])
+def analyze_zones(gray, brow, num_zones=5):
+    """5구역 분할 분석"""
+    x, y, w, h = brow["bbox"]
+    zone_width = w // num_zones
+    bg_value = float(np.median(gray))
+
+    zones = []
+    for i in range(num_zones):
+        zx = x + i * zone_width
+        zw = zone_width if i < num_zones - 1 else (w - i * zone_width)
+
+        roi = gray[y:y+h, zx:zx+zw]
+        mask_roi = np.zeros_like(roi)
+        shifted = brow["contour"].copy()
+        shifted[:, 0, 0] -= zx
+        shifted[:, 0, 1] -= y
+        cv2.drawContours(mask_roi, [shifted], -1, 255, -1)
+
+        brow_pixels = roi[mask_roi > 0]
+
+        if len(brow_pixels) == 0:
+            zones.append({"darkness": 0, "density": 0, "pixel_count": 0})
+            continue
+
+        darkness = max(0, float(bg_value - np.mean(brow_pixels)))
+
+        dark_threshold = bg_value * 0.85
+        dark_count = np.sum(brow_pixels < dark_threshold)
+        density = (dark_count / len(brow_pixels)) * 100
+
+        zones.append({
+            "darkness": round(darkness, 1),
+            "density": round(density, 1),
+            "pixel_count": int(len(brow_pixels)),
+        })
+
+    return zones
 
 
-def handle_image(reply_token, msg):
-    image_bytes = get_line_image(msg["id"])
-    if not image_bytes:
-        reply_message(reply_token, [{"type": "text", "text": "画像の取得に失敗しました。もう一度送ってください🙏"}])
-        return
-    result = analyze_image_bytes(image_bytes)
-    if "error" in result:
-        reply_message(reply_token, [{"type": "text", "text": result["error"]}])
-        return
-    reply_message(reply_token, [{"type": "text", "text": format_line_message(result)}])
+def normalize_to_80(zones):
+    max_dark = max(z["darkness"] for z in zones) if zones else 1
+    if max_dark == 0:
+        return [0] * len(zones)
+    scale = 80 / max_dark
+    return [round(z["darkness"] * scale, 1) for z in zones]
 
 
-def handle_text(reply_token, user_id, text):
-    if text.strip().lower() in ("myid", "id"):
-        reply_message(reply_token, [{"type": "text", "text": f"あなたのUser ID:\n{user_id}"}])
-        return
+def generate_feedback(zones, pattern="SOFT"):
+    """피드백 생성 — 일본어, 친절한 톤, 40점 캘리브레이션"""
+    ref = PATTERN_REFS.get(pattern, PATTERN_REFS["SOFT"])
+    ref_dark = ref["darkness"]
+    ref_dens = ref["density"]
 
-    cache_key = hashlib.md5(text.encode()).hexdigest()
-    if cache_key in response_cache:
-        cached = response_cache[cache_key]
-        if time.time() - cached["time"] < CACHE_TTL:
-            reply_message(reply_token, [{"type": "text", "text": cached["response"]}])
-            return
+    improvements = []  # (icon, text)
+    total_deduction = 0
 
-    user_name = get_user_name(user_id)
-    name_prefix = f"{user_name}さん、" if user_name else ""
+    stu_dark = [z["darkness"] for z in zones]
+    stu_dens = [z["density"] for z in zones]
+    profile_80 = normalize_to_80(zones)
+    teacher_profile = TEACHER_REF["profile_80"]
 
-    matched = find_best_qa_match(text)
-    if matched:
-        resp = name_prefix + matched
-        response_cache[cache_key] = {"response": resp, "time": time.time()}
-        reply_message(reply_token, [{"type": "text", "text": resp}])
-        return
+    avg_dark_80 = sum(profile_80) / 5
+    stu_avg = sum(stu_dark) / 5
+    ref_avg = sum(ref_dark) / 5
+    diff_avg = stu_avg - ref_avg
+    grad_range = max(profile_80) - min(profile_80)
 
-    if CLAUDE_API_KEY:
-        claude_resp = call_claude(text)
-        if claude_resp:
-            resp = name_prefix + claude_resp
-            response_cache[cache_key] = {"response": resp, "time": time.time()}
-            reply_message(reply_token, [{"type": "text", "text": resp}])
-            return
+    # === 1. 레이어링 부족 ===
+    if avg_dark_80 < 35:
+        improvements.append(("🔴", "全体的にレイヤリング回数が大幅に不足しています。先生は5回以上重ねていますが、この仕上がりは1〜2回程度です。同じ弱い力でもう3回以上重ねてください。重ねれば重ねるほど「面」になります。"))
+        total_deduction += 15
+    elif avg_dark_80 < 55:
+        improvements.append(("🔴", "全体的にレイヤリング回数が足りません。先生は5回以上重ねていますが、この仕上がりは2回程度です。同じ弱い力でもう3回以上重ねてください。重ねれば重ねるほど面になります。"))
+        total_deduction += 10
 
-    reply_message(reply_token, [{"type": "text", "text": f"{name_prefix}ご質問ありがとうございます！先生に確認して改めてお返事しますね☺️"}])
+    # === 2. 전체 과다 ===
+    if diff_avg > 15:
+        improvements.append(("🔴", f"全体的に濃すぎます。力を入れるのではなく、赤ちゃんのほっぺを触るくらいやさしく、同じ弱い力で何回も重ねてください。バウンド高さ3〜5mmを意識しましょう。"))
+        total_deduction += 10
+    elif diff_avg > 8:
+        improvements.append(("🟡", "少し濃い傾向です。圧力をもう少し抑えてみてください。"))
+        total_deduction += 5
+
+    # === 3. 오렌지존 분리 ===
+    ref_jump_2 = ref_dark[2] - ref_dark[1]
+    ref_jump_4 = ref_dark[2] - ref_dark[3]
+    stu_jump_2 = stu_dark[2] - stu_dark[1]
+    stu_jump_4 = stu_dark[2] - stu_dark[3]
+
+    if stu_jump_2 > ref_jump_2 * 2 + 5 or stu_jump_4 > ref_jump_4 * 2 + 5:
+        improvements.append(("🔴", "オレンジゾーンの陰影と外側のグラデーションが分離して見えます。オレンジゾーンから上/横に力を抜きながらレイヤリングをつなげて、2〜3mmのブレンディング区間を作ってください。"))
+        total_deduction += 12
+
+    # === 4. 점 간격 과밀 ===
+    stu_avg_dens = sum(stu_dens) / 5
+    ref_avg_dens = sum(ref_dens) / 5
+    dens_diff = stu_avg_dens - ref_avg_dens
+
+    if dens_diff > 20:
+        improvements.append(("🔴", "点の間隔が詰まりすぎてグラデーション感がなくなっています。特に上段は点の間隔を広げて、皮膚が見えるように「解いて」あげてください。"))
+        total_deduction += 10
+    elif dens_diff > 10:
+        improvements.append(("🟡", "全体的に密度が高めです。点の間隔をもう少し広げてみてください。"))
+        total_deduction += 5
+
+    # === 5. 얼룩 ===
+    stu_range = max(stu_dark) - min(stu_dark)
+    ref_range_val = max(ref_dark) - min(ref_dark)
+
+    if diff_avg > 10 and stu_range > ref_range_val * 1.5:
+        improvements.append(("🟡", "ムラ（まだら）が見えます。均一な圧で丁寧に重ねましょう。均一でないと定着後にまだらに残ってしまいます。"))
+        total_deduction += 5
+
+    # === 6. 앞머리 그라데이션 ===
+    stu_gradient = stu_dark[2] - stu_dark[0]
+    ref_gradient = ref_dark[2] - ref_dark[0]
+
+    if pattern in ("SOFT", "MIX"):
+        if stu_gradient < 3:
+            improvements.append(("🔴", "眉頭〜中央のグラデーションがほぼありません。眉頭は「消えるように」、中央（オレンジゾーン）は何回も重ねて濃くして、明暗の差を作ってください。"))
+            total_deduction += 10
+        elif stu_gradient < ref_gradient * 0.5:
+            improvements.append(("🟡", "眉頭〜中央のグラデーションがもう少し必要です。眉頭をもっと薄く、中央をもっと濃くして差を作りましょう。"))
+            total_deduction += 5
+
+    # === 7. 미두 뭉침 ===
+    if profile_80[0] > 8:
+        improvements.append(("🟡", f"眉頭がやや濃いです（先生の{profile_80[0]:.0f}倍）。もう少し力を抜いてタッチしてください。眉頭は「空ける」のではなく「弱く何回も重ねて自然に見せる」のが正解です。"))
+        total_deduction += 5
+
+    # === 8. 프로파일 평탄 ===
+    if grad_range < 15:
+        improvements.append(("🔴", f"全体が均一で、グラデーションになっていません。先生の眉は眉頭（薄い）→眉上（濃い）→眉尾（薄い）の曲線ですが、この作品は平坦です。眉頭をもっと薄く、眉上をもっと濃くして、明暗の差を作ってください。"))
+        total_deduction += 10
+    elif grad_range < 25:
+        improvements.append(("🟡", "グラデーションの幅がもう少し欲しいです。オレンジゾーンをもう少し濃く重ねて、眉頭との差を広げてみてください。"))
+        total_deduction += 5
+
+    # === 9. 꼬리 역전 ===
+    if stu_dark[4] > stu_dark[2]:
+        improvements.append(("🟡", "眉尻が中央より濃くなっています。眉尻は自然にフェードアウトするように点を減らし間隔を広げてください。"))
+        total_deduction += 5
+
+    score = max(0, min(100, 100 - total_deduction))
+
+    return {
+        "score": score,
+        "improvements": improvements,
+        "profile_80": profile_80,
+        "grad_range": round(grad_range, 1),
+        "avg_dark_80": round(avg_dark_80, 1),
+    }
 
 
-def call_claude(text):
+def detect_pattern(zones):
+    profile_80 = normalize_to_80(zones)
+    avg_dark = sum(profile_80) / 5
+
+    if avg_dark < 40:
+        return "判別不可"
+
+    scores = {}
+    for name, ref in PATTERN_REFS.items():
+        diff = sum(abs(zones[i]["darkness"] - ref["darkness"][i]) for i in range(5))
+        dens_diff = sum(abs(zones[i]["density"] - ref["density"][i]) for i in range(5))
+        scores[name] = diff + dens_diff * 0.5
+
+    best = min(scores, key=scores.get)
+    second = sorted(scores.values())[1]
+    gap = second - scores[best]
+
+    if gap < 10:
+        return "判別不可"
+    return best
+
+
+def analyze_image(image_path):
+    """메인 분석 — 파일 경로"""
+    image = cv2.imread(image_path)
+    if image is None:
+        return {"error": "画像を読み取れません。もう一度送ってください🙏"}
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    brows = detect_brows(image)
+
+    if not brows:
+        return {"error": "眉毛を検出できませんでした。眉毛がはっきり見える写真でもう一度送ってください🙏"}
+
+    # 가장 큰 눈썹 1개만 분석 (복수 눈썹은 3패턴 과제일 때만)
+    brow = brows[0]
+    zones = analyze_zones(gray, brow)
+    pattern = detect_pattern(zones)
+    target = pattern if pattern in PATTERN_REFS else "SOFT"
+    analysis = generate_feedback(zones, target)
+
+    # 프로파일 데이터
+    profile_80 = analysis["profile_80"]
+    teacher = TEACHER_REF["profile_80"]
+
+    # 구역별 판정
+    zone_labels = ["眉頭(前)", "眉頭〜眉上", "眉上(中央)", "眉上〜眉尾", "眉尾(尻)"]
+    zone_results = []
+    for i in range(5):
+        diff = profile_80[i] - teacher[i]
+        abs_diff = abs(diff)
+        if abs_diff <= 5:
+            icon = "✅"
+        elif abs_diff <= 10:
+            icon = "🟡"
+        else:
+            icon = "🔴"
+        zone_results.append(f"{icon} {zone_labels[i]}: {profile_80[i]:.0f} (先生{teacher[i]}, 差{diff:+.0f})")
+
+    # 가장 진한 구역
+    peak_idx = profile_80.index(max(profile_80))
+    peak_name = zone_labels[peak_idx]
+
+    return {
+        "score": analysis["score"],
+        "avg_dark_80": analysis["avg_dark_80"],
+        "grad_range": analysis["grad_range"],
+        "peak_zone": peak_name,
+        "profile_80": profile_80,
+        "zone_results": zone_results,
+        "improvements": analysis["improvements"],
+        "pattern": pattern,
+        "brow_count": len(brows),
+    }
+
+
+def analyze_image_bytes(image_bytes):
+    """바이트 데이터로 분석"""
+    tmp_path = os.path.join(tempfile.gettempdir(), f"brow_{int(time.time() * 1000)}.jpg")
     try:
-        resp = httpx.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 500,
-                  "system": get_system_prompt(),
-                  "messages": [{"role": "user", "content": text}]}, timeout=25)
-        if resp.status_code == 200:
-            return resp.json()["content"][0]["text"]
-    except Exception as e:
-        print(f"Claude error: {e}")
-    return None
+        with open(tmp_path, "wb") as f:
+            f.write(image_bytes)
+        return analyze_image(tmp_path)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except:
+            pass
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    return "OK"
+def format_line_message(result):
+    """LINE 전송용 메시지 — 기존 포맷 유지, 친절한 톤"""
+    if "error" in result:
+        return result["error"]
+
+    score = result["score"]
+    profile = result["profile_80"]
+    teacher = TEACHER_REF["profile_80"]
+
+    lines = []
+    lines.append("ご提出ありがとうございます！🙇")
+    lines.append("添削させていただきます。")
+    lines.append(f"📊 分析結果")
+    lines.append(f"総合スコア: {score}/100")
+    lines.append(f"濃さ: 先生=80 → 学生={result['avg_dark_80']:.0f}")
+    lines.append(f"グラデーション幅: 先生=40 → 学生={result['grad_range']:.0f}")
+    lines.append(f"一番濃いゾーン: {result['peak_zone']}")
+
+    lines.append("【ゾーン別】")
+    for zr in result["zone_results"]:
+        lines.append(zr)
+
+    lines.append(f"📈 プロファイル:")
+    lines.append(f"学生: {' → '.join(str(int(p)) for p in profile)}")
+    lines.append(f"先生: {' → '.join(str(p) for p in teacher)}")
+
+    if result["improvements"]:
+        lines.append("【改善ポイント】")
+        for icon, text in result["improvements"]:
+            lines.append(f"{icon} {text}")
+
+    lines.append("引き続き練習を頑張ってください！")
+    lines.append("何かご不明な点がございましたら、お気軽にご質問ください☺️")
+
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    import sys
+    if len(sys.argv) > 1:
+        result = analyze_image(sys.argv[1])
+        print(format_line_message(result))
+    else:
+        print("Usage: python image_analyzer.py <image_path>")
