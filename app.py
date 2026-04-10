@@ -12,16 +12,10 @@ import base64
 import time
 import re
 import httpx
-
-# 파일 상단에 추가
-from qa_engine import get_system_prompt
 from flask import Flask, request, abort
+from qa_engine import find_best_qa_match, get_system_prompt
+from image_analyzer import analyze_image
 
-from image_analyzer import analyze_student_brow
-
-
-# call_claude() 함수 안에서 system 파라미터 교체
-"system": get_system_prompt(),
 app = Flask(__name__)
 
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
@@ -29,12 +23,10 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 
 # 무시할 사람 닉네임 (선생님, 보조쌤)
-# Render 환경변수: IGNORE_NAMES=KIE,ゆき,C
 IGNORE_NAMES = set(filter(None, os.environ.get("IGNORE_NAMES", "").split(",")))
 
 response_cache = {}
 CACHE_TTL = 3600
-
 
 
 # ═══════════════════════════════════════
@@ -152,7 +144,7 @@ def webhook():
         source_type = event["source"]["type"]
         msg = event["message"]
 
-        # ── 그룹/룸 → 번역만 (Q&A 답장 안 함) ──
+        # ── 그룹/룸 → 번역 + 이미지 분석 ──
         if source_type in ("group", "room"):
             group_id = event["source"].get("groupId") or event["source"].get("roomId", "")
             if msg["type"] == "text":
@@ -160,12 +152,11 @@ def webhook():
             elif msg["type"] == "image":
                 handle_group_image(reply_token, group_id, user_id, msg)
 
-        # ── 1:1 → 일본어만 응답 (한국어=선생님이니까 무시) ──
+        # ── 1:1 → 일본어만 응답 ──
         elif source_type == "user":
             if msg["type"] == "image":
                 handle_image(reply_token, user_id, msg)
             elif msg["type"] == "text":
-                # 한국어면 선생님/보조쌤 → 무시
                 if detect_language(msg["text"]) == "ko":
                     continue
                 handle_text(reply_token, user_id, msg["text"])
@@ -181,24 +172,18 @@ def handle_group_text(reply_token, group_id, user_id, text):
     if len(text.strip()) < 3:
         return
 
-    # 발신자 이름 확인
     sender_name = get_group_member_name(group_id, user_id)
     is_staff = sender_name in IGNORE_NAMES
     lang = detect_language(text)
 
     if lang == "ko":
-        # 한국어 = 선생님 → 일본어로 번역 (학생이 읽을 수 있게)
         translated = translate_text(text, "ko", "ja")
         if translated:
             reply_message(reply_token, [{"type": "text", "text": f"🇯🇵 {translated}"}])
-
     elif lang == "ja" and not is_staff:
-        # 일본어 + 학생(스태프 아님) → 한국어로 번역 (선생님이 읽을 수 있게)
         translated = translate_text(text, "ja", "ko")
         if translated:
             reply_message(reply_token, [{"type": "text", "text": f"🇰🇷 {translated}"}])
-
-    # 일본어 + 보조쌤(KIE, ゆき) → 무시 (번역 필요 없음)
 
 
 def handle_group_image(reply_token, group_id, user_id, msg):
@@ -206,30 +191,55 @@ def handle_group_image(reply_token, group_id, user_id, msg):
     if not image_bytes:
         return
 
-    result = analyze_student_brow(image_bytes)
+    # 이미지를 임시 파일로 저장 후 분석
+    tmp_path = f"/tmp/brow_{msg['id']}.jpg"
+    with open(tmp_path, "wb") as f:
+        f.write(image_bytes)
+
+    result = analyze_image(tmp_path)
+
+    # 임시 파일 삭제
+    try:
+        os.remove(tmp_path)
+    except:
+        pass
+
     if "error" in result:
         return
 
-    messages = [{"type": "text", "text": result["message_ja"]}]
+    # 첫 번째 눈썹 결과로 메시지 생성
+    if result.get("results"):
+        first = result["results"][0]
+        score = first["analysis"]["score"]
+        feedback = first["analysis"]["feedback"]
 
-    # 선생님용 한국어 요약
-    prob_names = {
-        "layering": "레이어링부족", "layering_mild": "레이어링약간부족",
-        "midu_dark": "미두뭉침", "midu_dark_mild": "미두약간진함",
-        "no_vertical": "수직그라데이션없음", "flat_profile": "프로파일평탄",
-        "flat_profile_mild": "프로파일약간평탄", "wrong_peak": "피크위치불일치",
-    }
-    probs = result.get("problems", [])
-    ko = f"🇰🇷 [분석] {result['score']}점"
-    if probs:
-        named = [prob_names.get(p, p) for p in probs if not p.startswith("break_")]
-        breaks = [p for p in probs if p.startswith("break_")]
-        if breaks:
-            named.append(f"끊김{len(breaks)}곳")
-        ko += f" | {', '.join(named)}"
-    messages.append({"type": "text", "text": ko})
+        # 일본어 피드백 조합
+        lines = [f"📊 スコア: {score}/100\n"]
 
-    reply_message(reply_token, messages)
+        good = [f for f in feedback if f["type"] == "good"]
+        for f in good:
+            lines.append(f"✨ {f['msg']}")
+
+        problems = [f for f in feedback if f["type"] in ("critical", "warning")]
+        if problems:
+            lines.append("\n【改善ポイント】")
+            for f in problems:
+                icon = "🔴" if f["type"] == "critical" else "🟡"
+                lines.append(f"{icon} {f['area']}: {f['msg']}")
+
+        lines.append("\n引き続き練習を頑張ってください！☺️")
+        ja_msg = "\n".join(lines)
+
+        messages = [{"type": "text", "text": ja_msg}]
+
+        # 선생님용 한국어 요약
+        prob_names = [f["area"] for f in problems]
+        ko = f"🇰🇷 [분석] {score}점"
+        if prob_names:
+            ko += f" | {', '.join(prob_names[:5])}"
+        messages.append({"type": "text", "text": ko})
+
+        reply_message(reply_token, messages)
 
 
 # ═══════════════════════════════════════
@@ -241,16 +251,34 @@ def handle_image(reply_token, user_id, msg):
     if not image_bytes:
         reply_message(reply_token, [{"type": "text", "text": "画像の取得に失敗しました。もう一度送ってください🙏"}])
         return
-    result = analyze_student_brow(image_bytes)
+
+    tmp_path = f"/tmp/brow_{msg['id']}.jpg"
+    with open(tmp_path, "wb") as f:
+        f.write(image_bytes)
+
+    result = analyze_image(tmp_path)
+
+    try:
+        os.remove(tmp_path)
+    except:
+        pass
+
     if "error" in result:
         reply_message(reply_token, [{"type": "text", "text": result["error"]}])
         return
-    reply_message(reply_token, [{"type": "text", "text": result["message_ja"]}])
+
+    if not result.get("results"):
+        reply_message(reply_token, [{"type": "text", "text": "眉毛を検出できませんでした。もう少し鮮明な写真で再度お送りください🙏"}])
+        return
+
+    # format_line_message 사용
+    from image_analyzer import format_line_message
+    ja_msg = format_line_message(result, "ja")
+    reply_message(reply_token, [{"type": "text", "text": ja_msg}])
 
 
 def handle_text(reply_token, user_id, text):
-    # User ID 확인 커맨드
-    if text.strip().lower() in ("myid", "id", "내아이디"):
+    if text.strip().lower() in ("myid", "id", "内アイディ"):
         reply_message(reply_token, [{"type": "text", "text": f"あなたのUser ID:\n{user_id}"}])
         return
 
@@ -264,17 +292,15 @@ def handle_text(reply_token, user_id, text):
     user_name = get_user_name(user_id)
     name_prefix = f"{user_name}さん、" if user_name else ""
 
-    try:
-        from qa_engine import find_best_qa_match
-        matched = find_best_qa_match(text)
-        if matched:
-            resp = name_prefix + matched
-            response_cache[cache_key] = {"response": resp, "time": time.time()}
-            reply_message(reply_token, [{"type": "text", "text": resp}])
-            return
-    except ImportError:
-        pass
+    # Q&A 매칭
+    matched = find_best_qa_match(text)
+    if matched:
+        resp = name_prefix + matched
+        response_cache[cache_key] = {"response": resp, "time": time.time()}
+        reply_message(reply_token, [{"type": "text", "text": resp}])
+        return
 
+    # Claude 폴백
     if CLAUDE_API_KEY:
         claude_resp = call_claude(text)
         if claude_resp:
@@ -295,7 +321,8 @@ def call_claude(text):
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
             json={
-                "model": "claude-sonnet-4-20250514", "max_tokens": 500,
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 500,
                 "system": get_system_prompt(),
                 "messages": [{"role": "user", "content": text}],
             },
