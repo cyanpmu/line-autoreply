@@ -1,8 +1,8 @@
 """
-파우더브로우 이미지 분석기 v3
+파우더브로우 이미지 분석기 v3.1
+- v3 기반 + 유저 지정 패턴으로 채점
+- 복수 눈썹 전체 출력 (1개씩 구분)
 - 선생님 피드백 규칙 8단계 구조 적용
-- 숫자와 해석 분리 / 문제 1개당 문단 1개 / 추상어 금지
-- 눈썹 1개만 감지 / 초록 커팅매트 제외
 """
 
 import cv2
@@ -88,7 +88,6 @@ def detect_brows(image):
         if candidates:
             break
 
-    # 위→아래 (y좌표) 순서로 정렬
     candidates.sort(key=lambda b: b["bbox"][1])
     return candidates
 
@@ -266,7 +265,11 @@ def _score_brow(zones, profile, pattern):
 # 메인 분석 함수
 # ══════════════════════════════════════
 
-def analyze_image(image_path):
+def analyze_image(image_path, pattern=None):
+    """
+    pattern: 유저가 지정한 패턴 (SOFT/NATURAL/MIX).
+             None이면 자동 판정.
+    """
     image = cv2.imread(image_path)
     if image is None:
         return {"error": "画像を読み取れません。もう一度送ってください🙏"}
@@ -283,18 +286,21 @@ def analyze_image(image_path):
     for idx, brow in enumerate(brows):
         zones   = analyze_zones(gray, brow)
         profile = to_80(zones)
+        avg80   = sum(profile) / 5
 
-        # 패턴 자동 판정
-        avg80 = sum(profile) / 5
-        pattern = "SOFT"
-        if avg80 >= 40:
-            scores = {
-                name: sum(abs(zones[i]["darkness"] - ref["dark"][i]) for i in range(5))
-                for name, ref in REFS.items()
-            }
-            best = min(scores, key=scores.get)
-            vals = sorted(scores.values())
-            pattern = best if (len(vals) >= 2 and vals[1] - vals[0] >= 10) else "SOFT"
+        # 패턴 결정: 유저 지정 우선, 없으면 자동 판정
+        if pattern and pattern in REFS:
+            use_pattern = pattern
+        else:
+            use_pattern = "SOFT"
+            if avg80 >= 40:
+                scores = {
+                    name: sum(abs(zones[i]["darkness"] - ref["dark"][i]) for i in range(5))
+                    for name, ref in REFS.items()
+                }
+                best = min(scores, key=scores.get)
+                vals = sorted(scores.values())
+                use_pattern = best if (len(vals) >= 2 and vals[1] - vals[0] >= 10) else "SOFT"
 
         grad_range = max(profile) - min(profile)
         peak_idx   = profile.index(max(profile))
@@ -306,12 +312,12 @@ def analyze_image(image_path):
             icon = "✅" if ad <= 5 else "🟡" if ad <= 10 else "🔴"
             zone_results.append(f"{icon} {ZONE_NAMES[i]}：{profile[i]:.0f}（先生{t[i]}、差{diff:+.0f}）")
 
-        score, points = _score_brow(zones, profile, pattern)
+        score, points = _score_brow(zones, profile, use_pattern)
 
         results.append({
             "brow_num":    idx + 1,
             "score":       score,
-            "pattern":     pattern,
+            "pattern":     use_pattern,
             "avg_dark_80": round(avg80, 1),
             "grad_range":  round(grad_range, 1),
             "peak_zone":   ZONE_NAMES[peak_idx],
@@ -323,18 +329,17 @@ def analyze_image(image_path):
     return {
         "brow_count": len(results),
         "results":    results,
-        # 편의용: 첫 번째 눈썹 점수를 최상위에 노출
         "score":      results[0]["score"] if results else 0,
     }
 
 
-def analyze_image_bytes(image_bytes):
-    """바이트에서 분석. tempfile.mkstemp으로 충돌 방지."""
+def analyze_image_bytes(image_bytes, pattern=None):
+    """바이트에서 분석. pattern: 유저 지정 패턴."""
     fd, tmp = tempfile.mkstemp(suffix=".jpg")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(image_bytes)
-        return analyze_image(tmp)
+        return analyze_image(tmp, pattern=pattern)
     finally:
         try:
             os.remove(tmp)
@@ -346,13 +351,45 @@ def analyze_image_bytes(image_bytes):
 # LINE 메시지 포맷 (선생님 규칙 8단계)
 # ══════════════════════════════════════
 
+def _format_single_brow(brow, t, ctx=None, show_header=False):
+    """1개 눈썹에 대한 피드백 텍스트 생성"""
+    lines = []
+
+    if show_header:
+        lines.append(f"━━ 眉{brow['brow_num']}（{brow['pattern']}）━━")
+        lines.append("")
+
+    # 2. 정량 결과
+    lines.append("📊 分析結果")
+    lines.append(f"総合スコア：{brow['score']} / 100")
+    lines.append(f"濃さ：先生 80 → 学生 {brow['avg_dark_80']:.0f}")
+    lines.append(f"グラデーション幅：先生 40 → 学生 {brow['grad_range']:.0f}")
+    lines.append(f"一番濃いゾーン：{brow['peak_zone']}")
+    lines.append("")
+    lines.append("【ゾーン別】")
+    for zr in brow["zone_results"]:
+        lines.append(zr)
+    lines.append("")
+    lines.append("📈 プロファイル")
+    lines.append(f"学生：{' → '.join(str(v) for v in brow['profile'])}")
+    lines.append(f"先生：{' → '.join(str(v) for v in t)}")
+
+    # 3~7. 개선 포인트
+    if brow["points"]:
+        lines.append("")
+        lines.append("【改善ポイント】")
+        for pt in brow["points"]:
+            lines.append("")
+            lines.append(pt)
+
+    return lines
+
+
 def format_line_message(result, context=None):
     """
-    LINE 전송용 메시지.
-    result: analyze_image_bytes() 반환값 (최상위 dict)
+    LINE 전송용 메시지. 복수 눈썹 전체 출력.
+    result: analyze_image_bytes() 반환값
     context: {name, pattern, technique, layering, needle, practice, difficulty, improvement}
-
-    ★ 수정: result["results"][0]에서 눈썹별 데이터를 꺼냄
     """
     if "error" in result:
         return result["error"]
@@ -362,17 +399,8 @@ def format_line_message(result, context=None):
 
     ctx  = context or {}
     t    = TEACHER["profile_80"]
-
-    # ─── 첫 번째 눈썹 데이터 참조 ───────────────────────────────────
-    brow = result["results"][0]
-    p          = brow["profile"]
-    score      = brow["score"]
-    avg80      = brow["avg_dark_80"]
-    grad_range = brow["grad_range"]
-    peak_zone  = brow["peak_zone"]
-    zone_results = brow["zone_results"]
-    points     = brow["points"]
-    # ─────────────────────────────────────────────────────────────────
+    brow_count = result["brow_count"]
+    multi = brow_count > 1
 
     lines = []
 
@@ -384,32 +412,12 @@ def format_line_message(result, context=None):
     lines.append("🙇 添削させていただきます。")
     lines.append("")
 
-    # 2. 정량 결과
-    lines.append("📊 分析結果")
-    lines.append(f"総合スコア：{score} / 100")
-    lines.append(f"濃さ：先生 80 → 学生 {avg80:.0f}")
-    lines.append(f"グラデーション幅：先生 40 → 学生 {grad_range:.0f}")
-    lines.append(f"一番濃いゾーン：{peak_zone}")
-    lines.append("")
-    lines.append("【ゾーン別】")
-    for zr in zone_results:
-        lines.append(zr)
-    lines.append("")
-    lines.append("📈 プロファイル")
-    lines.append(f"学生：{' → '.join(str(v) for v in p)}")
-    lines.append(f"先生：{' → '.join(str(v) for v in t)}")
-
-    # 복수 눈썹인 경우 안내
-    if result["brow_count"] > 1:
-        lines.append(f"\n（※ {result['brow_count']}個の眉毛を検出。上記は1番目の分析です）")
-
-    # 3~7. 개선 포인트
-    if points:
-        lines.append("")
-        lines.append("【改善ポイント】")
-        for pt in points:
+    # 각 눈썹 출력
+    for brow in result["results"]:
+        brow_lines = _format_single_brow(brow, t, ctx, show_header=multi)
+        lines.extend(brow_lines)
+        if multi:
             lines.append("")
-            lines.append(pt)
 
     # 컨텍스트 기반 추가 피드백
     extras = []
@@ -452,6 +460,7 @@ def format_line_message(result, context=None):
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
-        print(format_line_message(analyze_image(sys.argv[1])))
+        p = sys.argv[2] if len(sys.argv) > 2 else None
+        print(format_line_message(analyze_image(sys.argv[1], pattern=p)))
     else:
-        print("Usage: python image_analyzer.py <image_path>")
+        print("Usage: python image_analyzer.py <image_path> [SOFT|NATURAL|MIX]")
