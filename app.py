@@ -15,7 +15,11 @@ import httpx
 from flask import Flask, request, abort
 
 from image_analyzer import analyze_student_brow
+# 파일 상단에 추가
+from qa_engine import get_system_prompt
 
+# call_claude() 함수 안에서 system 파라미터 교체
+"system": get_system_prompt(),
 app = Flask(__name__)
 
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
@@ -29,11 +33,7 @@ IGNORE_NAMES = set(filter(None, os.environ.get("IGNORE_NAMES", "").split(",")))
 response_cache = {}
 CACHE_TTL = 3600
 
-# 파일 상단에 추가
-from qa_engine import get_system_prompt
 
-# call_claude() 함수 안에서 system 파라미터 교체
-"system": get_system_prompt(),
 
 # ═══════════════════════════════════════
 # LINE API
