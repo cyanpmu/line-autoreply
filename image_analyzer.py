@@ -1,20 +1,20 @@
 """
-파우더브로우 이미지 분석기 v2
-- v2 강화 채점 (선생님 피드백 반영)
-- OpenCV만 사용 (무료)
-- analyze_image(path) 또는 analyze_image_bytes(bytes) 호출
+파우더브로우 이미지 분석기 v3
+- 일본어 메시지 출력
+- 눈썹 오감지 방지 강화
+- 선생님 기준 40점 캘리브레이션
+- 친절한 톤
 """
 
 import cv2
 import numpy as np
 import json
 import os
+import time
 import tempfile
 
-# 선생님 기준 데이터
 TEACHER_REF = {
     "profile_80": [1, 28, 40, 35, 14],
-    "raw_darkness": 61.3,
     "gradient_range": 40,
 }
 
@@ -33,54 +33,66 @@ PATTERN_REFS = {
     },
 }
 
-COMMON_PROBLEMS = {
-    "layering": "レイヤリング不足",
-    "midu_dark": "眉頭が濃すぎ",
-    "separation": "オレンジゾーン分離",
-    "gap": "区間の途切れ",
-    "flat_profile": "プロファイル平坦",
-    "no_vertical": "垂直グラデーションなし",
-    "pressure_high": "圧/深さ過多",
-    "density_high": "点の間隔が詰まりすぎ",
-    "blotchy": "ムラ/不均一",
-    "no_head_gradient": "眉頭グラデーションなし",
-}
-
 
 def detect_brows(image):
-    """눈썹 영역 감지 (복수 눈썹 지원)"""
+    """눈썹 영역 감지 — 오감지 방지 강화"""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    h, w = gray.shape
 
     bg_value = np.median(gray)
-    threshold = bg_value * 0.75
+    threshold = bg_value * 0.72
     _, binary = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY_INV)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (10, 5))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 7))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 3)))
 
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     brows = []
-    min_area = image.shape[0] * image.shape[1] * 0.005
+    img_area = h * w
+    min_area = img_area * 0.008
+    max_area = img_area * 0.35
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area > min_area:
-            x, y, w, h = cv2.boundingRect(cnt)
-            aspect = w / h if h > 0 else 0
-            if 1.5 < aspect < 8.0:
-                brows.append({"contour": cnt, "bbox": (x, y, w, h), "area": area})
+        if area < min_area or area > max_area:
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        aspect = bw / bh if bh > 0 else 0
+
+        # 눈썹 형태 필터: 가로가 세로보다 2~7배 길어야 함
+        if aspect < 2.0 or aspect > 7.0:
+            continue
+
+        # 이미지 가장자리 (상단 10%, 하단 15%) 제외 — 커팅매트/텍스트
+        if y < h * 0.10 or (y + bh) > h * 0.85:
+            continue
+
+        # 너무 작은 높이 제외
+        if bh < h * 0.05:
+            continue
+
+        brows.append({"contour": cnt, "bbox": (x, y, bw, bh), "area": area})
+
+    # 면적 기준 상위 1~3개만 (가장 큰 것이 진짜 눈썹)
+    brows.sort(key=lambda b: b["area"], reverse=True)
+
+    # 가장 큰 눈썹 대비 30% 미만인 것은 제외
+    if brows:
+        max_area_found = brows[0]["area"]
+        brows = [b for b in brows if b["area"] > max_area_found * 0.3]
 
     brows.sort(key=lambda b: b["bbox"][0])
-    return brows
+    return brows[:3]  # 최대 3개
 
 
 def analyze_zones(gray, brow, num_zones=5):
     """5구역 분할 분석"""
     x, y, w, h = brow["bbox"]
     zone_width = w // num_zones
-
     bg_value = float(np.median(gray))
 
     zones = []
@@ -105,7 +117,7 @@ def analyze_zones(gray, brow, num_zones=5):
 
         dark_threshold = bg_value * 0.85
         dark_count = np.sum(brow_pixels < dark_threshold)
-        density = (dark_count / len(brow_pixels)) * 100 if len(brow_pixels) > 0 else 0
+        density = (dark_count / len(brow_pixels)) * 100
 
         zones.append({
             "darkness": round(darkness, 1),
@@ -117,7 +129,6 @@ def analyze_zones(gray, brow, num_zones=5):
 
 
 def normalize_to_80(zones):
-    """선생님 80기준으로 정규화"""
     max_dark = max(z["darkness"] for z in zones) if zones else 1
     if max_dark == 0:
         return [0] * len(zones)
@@ -125,87 +136,71 @@ def normalize_to_80(zones):
     return [round(z["darkness"] * scale, 1) for z in zones]
 
 
-def generate_feedback_v2(zones, pattern="SOFT"):
-    """v2 강화 피드백 생성 — 선생님 기준 40점 캘리브레이션"""
+def generate_feedback(zones, pattern="SOFT"):
+    """피드백 생성 — 일본어, 친절한 톤, 40점 캘리브레이션"""
     ref = PATTERN_REFS.get(pattern, PATTERN_REFS["SOFT"])
     ref_dark = ref["darkness"]
     ref_dens = ref["density"]
 
-    feedback = []
-    problems = []
+    improvements = []  # (icon, text)
     total_deduction = 0
 
     stu_dark = [z["darkness"] for z in zones]
     stu_dens = [z["density"] for z in zones]
     profile_80 = normalize_to_80(zones)
+    teacher_profile = TEACHER_REF["profile_80"]
 
-    # === 1. 전체 레이어링 체크 ===
     avg_dark_80 = sum(profile_80) / 5
-    if avg_dark_80 < 35:
-        feedback.append({"type": "critical", "area": "全体レイヤリング", "weight": 15,
-            "msg": f"レイヤリングが大幅に不足しています（80基準平均{avg_dark_80:.0f}）。同じ弱い力で5回以上重ねてください。"})
-        problems.append("layering")
-        total_deduction += 15
-    elif avg_dark_80 < 55:
-        feedback.append({"type": "critical", "area": "レイヤリング不足", "weight": 12,
-            "msg": f"レイヤリングが不足しています（80基準平均{avg_dark_80:.0f}）。パスを追加してください。"})
-        problems.append("layering")
-        total_deduction += 12
-
-    # === 2. 전체 과다 (압/깊이) ===
     stu_avg = sum(stu_dark) / 5
     ref_avg = sum(ref_dark) / 5
     diff_avg = stu_avg - ref_avg
+    grad_range = max(profile_80) - min(profile_80)
 
+    # === 1. 레이어링 부족 ===
+    if avg_dark_80 < 35:
+        improvements.append(("🔴", "全体的にレイヤリング回数が大幅に不足しています。先生は5回以上重ねていますが、この仕上がりは1〜2回程度です。同じ弱い力でもう3回以上重ねてください。重ねれば重ねるほど「面」になります。"))
+        total_deduction += 15
+    elif avg_dark_80 < 55:
+        improvements.append(("🔴", "全体的にレイヤリング回数が足りません。先生は5回以上重ねていますが、この仕上がりは2回程度です。同じ弱い力でもう3回以上重ねてください。重ねれば重ねるほど面になります。"))
+        total_deduction += 10
+
+    # === 2. 전체 과다 ===
     if diff_avg > 15:
-        feedback.append({"type": "critical", "area": "圧/深さ過多", "weight": 12,
-            "msg": f"全体的に濃すぎます（差+{diff_avg:.0f}）。赤ちゃんのほっぺくらいやさしく！濃くしたい部分は強く押すのではなく、弱い力で何回も重ねます。バウンド高さ3〜5mmを意識。"})
-        problems.append("pressure_high")
-        total_deduction += 12
+        improvements.append(("🔴", f"全体的に濃すぎます。力を入れるのではなく、赤ちゃんのほっぺを触るくらいやさしく、同じ弱い力で何回も重ねてください。バウンド高さ3〜5mmを意識しましょう。"))
+        total_deduction += 10
     elif diff_avg > 8:
-        feedback.append({"type": "warning", "area": "やや濃い", "weight": 6,
-            "msg": f"少し濃い傾向です（差+{diff_avg:.0f}）。圧力を少し抑えてください。"})
-        total_deduction += 6
+        improvements.append(("🟡", "少し濃い傾向です。圧力をもう少し抑えてみてください。"))
+        total_deduction += 5
 
     # === 3. 오렌지존 분리 ===
-    z3 = stu_dark[2]
-    z2 = stu_dark[1]
-    z4 = stu_dark[3]
     ref_jump_2 = ref_dark[2] - ref_dark[1]
     ref_jump_4 = ref_dark[2] - ref_dark[3]
-    stu_jump_2 = z3 - z2
-    stu_jump_4 = z3 - z4
+    stu_jump_2 = stu_dark[2] - stu_dark[1]
+    stu_jump_4 = stu_dark[2] - stu_dark[3]
 
     if stu_jump_2 > ref_jump_2 * 2 + 5 or stu_jump_4 > ref_jump_4 * 2 + 5:
-        feedback.append({"type": "critical", "area": "オレンジゾーン分離", "weight": 15,
-            "msg": "オレンジゾーン（Z3）が周囲と分離して「帯」のように浮いて見えます。オレンジゾーンから上/横にレイヤリングをつなげて、2〜3mmのブレンディング区間を作ってください。"})
-        problems.append("separation")
-        total_deduction += 15
+        improvements.append(("🔴", "オレンジゾーンの陰影と外側のグラデーションが分離して見えます。オレンジゾーンから上/横に力を抜きながらレイヤリングをつなげて、2〜3mmのブレンディング区間を作ってください。"))
+        total_deduction += 12
 
     # === 4. 점 간격 과밀 ===
     stu_avg_dens = sum(stu_dens) / 5
     ref_avg_dens = sum(ref_dens) / 5
     dens_diff = stu_avg_dens - ref_avg_dens
 
-    if dens_diff > 15:
-        feedback.append({"type": "critical", "area": "点の間隔が詰まりすぎ", "weight": 12,
-            "msg": f"点の間隔が狭すぎてグラデーション感がありません（密度{stu_avg_dens:.0f}% vs 正解{ref_avg_dens:.0f}%）。上段は点の間隔を広げて皮膚が見えるように「解いて」ください。"})
-        problems.append("density_high")
-        total_deduction += 12
-    elif dens_diff > 8:
-        feedback.append({"type": "warning", "area": "密度やや高い", "weight": 6,
-            "msg": f"全体密度が高めです（{stu_avg_dens:.0f}% vs 正解{ref_avg_dens:.0f}%）。"})
-        total_deduction += 6
+    if dens_diff > 20:
+        improvements.append(("🔴", "点の間隔が詰まりすぎてグラデーション感がなくなっています。特に上段は点の間隔を広げて、皮膚が見えるように「解いて」あげてください。"))
+        total_deduction += 10
+    elif dens_diff > 10:
+        improvements.append(("🟡", "全体的に密度が高めです。点の間隔をもう少し広げてみてください。"))
+        total_deduction += 5
 
-    # === 5. 얼룩/불균일 ===
+    # === 5. 얼룩 ===
     stu_range = max(stu_dark) - min(stu_dark)
     ref_range_val = max(ref_dark) - min(ref_dark)
 
     if diff_avg > 10 and stu_range > ref_range_val * 1.5:
-        feedback.append({"type": "critical", "area": "ムラ/不均一", "weight": 10,
-            "msg": f"濃い上にムラが目立ちます（明暗幅{stu_range:.0f} vs 正解{ref_range_val:.0f}）。均一な圧で丁寧に重ねてください。均一でないと定着後にまだらに残ります。"})
-        problems.append("blotchy")
-        total_deduction += 10
+        improvements.append(("🟡", "ムラ（まだら）が見えます。均一な圧で丁寧に重ねましょう。均一でないと定着後にまだらに残ってしまいます。"))
+        total_deduction += 5
 
     # === 6. 앞머리 그라데이션 ===
     stu_gradient = stu_dark[2] - stu_dark[0]
@@ -213,104 +208,47 @@ def generate_feedback_v2(zones, pattern="SOFT"):
 
     if pattern in ("SOFT", "MIX"):
         if stu_gradient < 3:
-            feedback.append({"type": "critical", "area": "眉頭グラデーションなし", "weight": 15,
-                "msg": f"眉頭→オレンジゾーンのグラデーションがほぼありません（明暗差{stu_gradient:.0f}、正解{ref_gradient:.0f}）。眉頭は極薄く（間隔0.7〜1.0mm）、中央は何回も重ねて濃く！"})
-            problems.append("no_head_gradient")
-            total_deduction += 15
-        elif stu_gradient < ref_gradient * 0.4:
-            feedback.append({"type": "critical", "area": "グラデーション不足", "weight": 12,
-                "msg": f"眉頭→オレンジゾーンのグラデーションが大幅に不足（{stu_gradient:.0f} vs 正解{ref_gradient:.0f}）。"})
-            problems.append("no_head_gradient")
-            total_deduction += 12
-        elif stu_gradient < ref_gradient * 0.6:
-            feedback.append({"type": "warning", "area": "グラデーション弱い", "weight": 8,
-                "msg": f"グラデーションがやや弱いです（{stu_gradient:.0f} vs 正解{ref_gradient:.0f}）。"})
-            total_deduction += 8
-        else:
-            feedback.append({"type": "good", "area": "水平グラデーション", "weight": 0,
-                "msg": "眉頭→オレンジゾーンのグラデーション方向は合っています！"})
-
-    # === 7. Z1→Z2→Z3 연속성 ===
-    z1z2 = stu_dark[1] - stu_dark[0]
-    z2z3 = stu_dark[2] - stu_dark[1]
-
-    if z1z2 < 2 and z2z3 > 8:
-        feedback.append({"type": "critical", "area": "眉頭〜中央の途切れ", "weight": 12,
-            "msg": "眉頭と眉頭〜眉上がほぼ同じ濃さなのに、オレンジゾーンで急に濃くなっています。眉頭→中央まで徐々に濃くなるグラデーションが必要です。"})
-        problems.append("gap")
-        total_deduction += 12
-
-    # === 8. 미두 뭉침 ===
-    if profile_80[0] > 8:
-        feedback.append({"type": "warning", "area": "眉頭が濃すぎ", "weight": 8,
-            "msg": f"眉頭が濃すぎます（80基準{profile_80[0]:.0f}、先生は1〜3）。「消えるように」仕上げてください。点3〜5個だけ、間隔0.7〜1.0mmで極わずかに。"})
-        problems.append("midu_dark")
-        total_deduction += 8
-
-    if len(stu_dens) > 0 and len(ref_dens) > 0 and stu_dens[0] > ref_dens[0] * 1.4:
-        feedback.append({"type": "warning", "area": "眉頭密度過多", "weight": 6,
-            "msg": f"眉頭の密度が高すぎます（{stu_dens[0]:.0f}% vs 正解{ref_dens[0]:.0f}%）。点を減らして間隔を広げ、スーッと現れる感じに。"})
-        total_deduction += 6
-
-    # === 9. 프로파일 평탄 ===
-    grad_range = max(profile_80) - min(profile_80)
-    if grad_range < 15:
-        feedback.append({"type": "critical", "area": "プロファイル平坦", "weight": 10,
-            "msg": f"グラデーション幅が狭すぎます（幅{grad_range:.0f}、先生は40）。オレンジゾーンは濃く重ね、眉頭/眉尻は力を抜いて。"})
-        problems.append("flat_profile")
-        total_deduction += 10
-    elif grad_range < 20:
-        feedback.append({"type": "warning", "area": "プロファイルやや平坦", "weight": 6,
-            "msg": f"グラデーション幅がやや狭いです（幅{grad_range:.0f}、先生は40）。"})
-        problems.append("flat_profile")
-        total_deduction += 6
-
-    # === 10. 꼬리 페이드아웃 ===
-    tail_drop = stu_dark[3] - stu_dark[4]
-    ref_tail_drop = ref_dark[3] - ref_dark[4]
-
-    if tail_drop < 0 and ref_tail_drop > 3:
-        feedback.append({"type": "critical", "area": "眉尻逆転", "weight": 10,
-            "msg": "眉尻が中間より濃いです！尻に向かって点を減らし間隔を広げてフェードアウト。"})
-        total_deduction += 10
-
-    # === 11. 구역별 상세 ===
-    zone_labels = ["眉頭(前)", "眉頭〜眉上", "眉上(中央)", "眉上〜眉尾", "眉尾(尻)"]
-    for i in range(5):
-        dd = stu_dark[i] - ref_dark[i]
-        if abs(dd) > 20:
-            feedback.append({"type": "critical", "area": zone_labels[i], "weight": 5,
-                "msg": f"{'かなり濃い' if dd > 0 else 'かなり薄い'}（差{'+' if dd > 0 else ''}{dd:.0f}）"})
+            improvements.append(("🔴", "眉頭〜中央のグラデーションがほぼありません。眉頭は「消えるように」、中央（オレンジゾーン）は何回も重ねて濃くして、明暗の差を作ってください。"))
+            total_deduction += 10
+        elif stu_gradient < ref_gradient * 0.5:
+            improvements.append(("🟡", "眉頭〜中央のグラデーションがもう少し必要です。眉頭をもっと薄く、中央をもっと濃くして差を作りましょう。"))
             total_deduction += 5
-        elif abs(dd) > 12:
-            feedback.append({"type": "warning", "area": zone_labels[i], "weight": 3,
-                "msg": f"{'やや濃い' if dd > 0 else 'やや薄い'}（差{'+' if dd > 0 else ''}{dd:.0f}）"})
-            total_deduction += 3
 
-    # 양호 항목
-    has_dark_issue = any(f["area"] in ("全体レイヤリング", "レイヤリング不足", "圧/深さ過多", "やや濃い") for f in feedback)
-    if not has_dark_issue:
-        feedback.insert(0, {"type": "good", "area": "全体明暗", "weight": 0,
-            "msg": "全体の明暗が正解と近いです！✨"})
+    # === 7. 미두 뭉침 ===
+    if profile_80[0] > 8:
+        improvements.append(("🟡", f"眉頭がやや濃いです（先生の{profile_80[0]:.0f}倍）。もう少し力を抜いてタッチしてください。眉頭は「空ける」のではなく「弱く何回も重ねて自然に見せる」のが正解です。"))
+        total_deduction += 5
+
+    # === 8. 프로파일 평탄 ===
+    if grad_range < 15:
+        improvements.append(("🔴", f"全体が均一で、グラデーションになっていません。先生の眉は眉頭（薄い）→眉上（濃い）→眉尾（薄い）の曲線ですが、この作品は平坦です。眉頭をもっと薄く、眉上をもっと濃くして、明暗の差を作ってください。"))
+        total_deduction += 10
+    elif grad_range < 25:
+        improvements.append(("🟡", "グラデーションの幅がもう少し欲しいです。オレンジゾーンをもう少し濃く重ねて、眉頭との差を広げてみてください。"))
+        total_deduction += 5
+
+    # === 9. 꼬리 역전 ===
+    if stu_dark[4] > stu_dark[2]:
+        improvements.append(("🟡", "眉尻が中央より濃くなっています。眉尻は自然にフェードアウトするように点を減らし間隔を広げてください。"))
+        total_deduction += 5
 
     score = max(0, min(100, 100 - total_deduction))
 
     return {
         "score": score,
-        "feedback": feedback,
-        "problems": problems,
+        "improvements": improvements,
         "profile_80": profile_80,
+        "grad_range": round(grad_range, 1),
+        "avg_dark_80": round(avg_dark_80, 1),
     }
 
 
 def detect_pattern(zones):
-    """패턴 구분 (솔직 판정)"""
     profile_80 = normalize_to_80(zones)
     avg_dark = sum(profile_80) / 5
 
     if avg_dark < 40:
-        return {"pattern": "判別不可", "confidence": 0,
-            "reason": "レイヤリングが不足でパターンの特徴が出ていません。まずレイヤリングを十分に重ねてから再提出してください。"}
+        return "判別不可"
 
     scores = {}
     for name, ref in PATTERN_REFS.items():
@@ -323,16 +261,12 @@ def detect_pattern(zones):
     gap = second - scores[best]
 
     if gap < 10:
-        return {"pattern": "判別不可", "confidence": 0,
-            "reason": "SOFTとMIXが似た数値です。どのパターンで作業されたか教えていただけますか？どの部分が難しかったかも教えてください。"}
-
-    confidence = min(100, int(gap * 3))
-    return {"pattern": best, "confidence": confidence,
-        "reason": f"{best}パターンと判断（類似度{confidence}%）"}
+        return "判別不可"
+    return best
 
 
 def analyze_image(image_path):
-    """메인 분석 함수 — 파일 경로 받음"""
+    """메인 분석 — 파일 경로"""
     image = cv2.imread(image_path)
     if image is None:
         return {"error": "画像を読み取れません。もう一度送ってください🙏"}
@@ -343,27 +277,50 @@ def analyze_image(image_path):
     if not brows:
         return {"error": "眉毛を検出できませんでした。眉毛がはっきり見える写真でもう一度送ってください🙏"}
 
-    results = []
-    for idx, brow in enumerate(brows):
-        zones = analyze_zones(gray, brow)
-        pat = detect_pattern(zones)
-        target = pat["pattern"] if pat["pattern"] in PATTERN_REFS else "SOFT"
-        analysis = generate_feedback_v2(zones, target)
+    # 가장 큰 눈썹 1개만 분석 (복수 눈썹은 3패턴 과제일 때만)
+    brow = brows[0]
+    zones = analyze_zones(gray, brow)
+    pattern = detect_pattern(zones)
+    target = pattern if pattern in PATTERN_REFS else "SOFT"
+    analysis = generate_feedback(zones, target)
 
-        results.append({
-            "brow_index": idx + 1,
-            "pattern": pat,
-            "analysis": analysis,
-        })
+    # 프로파일 데이터
+    profile_80 = analysis["profile_80"]
+    teacher = TEACHER_REF["profile_80"]
+
+    # 구역별 판정
+    zone_labels = ["眉頭(前)", "眉頭〜眉上", "眉上(中央)", "眉上〜眉尾", "眉尾(尻)"]
+    zone_results = []
+    for i in range(5):
+        diff = profile_80[i] - teacher[i]
+        abs_diff = abs(diff)
+        if abs_diff <= 5:
+            icon = "✅"
+        elif abs_diff <= 10:
+            icon = "🟡"
+        else:
+            icon = "🔴"
+        zone_results.append(f"{icon} {zone_labels[i]}: {profile_80[i]:.0f} (先生{teacher[i]}, 差{diff:+.0f})")
+
+    # 가장 진한 구역
+    peak_idx = profile_80.index(max(profile_80))
+    peak_name = zone_labels[peak_idx]
 
     return {
+        "score": analysis["score"],
+        "avg_dark_80": analysis["avg_dark_80"],
+        "grad_range": analysis["grad_range"],
+        "peak_zone": peak_name,
+        "profile_80": profile_80,
+        "zone_results": zone_results,
+        "improvements": analysis["improvements"],
+        "pattern": pattern,
         "brow_count": len(brows),
-        "results": results,
     }
 
 
 def analyze_image_bytes(image_bytes):
-    """바이트 데이터로 분석 — app.py에서 직접 호출용"""
+    """바이트 데이터로 분석"""
     tmp_path = os.path.join(tempfile.gettempdir(), f"brow_{int(time.time() * 1000)}.jpg")
     try:
         with open(tmp_path, "wb") as f:
@@ -376,52 +333,39 @@ def analyze_image_bytes(image_bytes):
             pass
 
 
-import time  # analyze_image_bytes에서 사용
-
-
-def format_line_message(result, lang="ja"):
-    """LINE 전송용 메시지 포맷"""
+def format_line_message(result):
+    """LINE 전송용 메시지 — 기존 포맷 유지, 친절한 톤"""
     if "error" in result:
-        return f"❌ {result['error']}"
+        return result["error"]
+
+    score = result["score"]
+    profile = result["profile_80"]
+    teacher = TEACHER_REF["profile_80"]
 
     lines = []
-    if lang == "ja":
-        lines.append("ご提出ありがとうございます！🙇")
-        lines.append("添削させていただきます。\n")
-    else:
-        lines.append("제출 감사합니다! 🙇\n")
+    lines.append("ご提出ありがとうございます！🙇")
+    lines.append("添削させていただきます。")
+    lines.append(f"📊 分析結果")
+    lines.append(f"総合スコア: {score}/100")
+    lines.append(f"濃さ: 先生=80 → 学生={result['avg_dark_80']:.0f}")
+    lines.append(f"グラデーション幅: 先生=40 → 学生={result['grad_range']:.0f}")
+    lines.append(f"一番濃いゾーン: {result['peak_zone']}")
 
-    for r in result["results"]:
-        a = r["analysis"]
-        score = a["score"]
-        pat = r["pattern"]
+    lines.append("【ゾーン別】")
+    for zr in result["zone_results"]:
+        lines.append(zr)
 
-        if result["brow_count"] > 1:
-            lines.append(f"━━ 眉{r['brow_index']} ({pat.get('pattern', '?')}) ━━")
+    lines.append(f"📈 プロファイル:")
+    lines.append(f"学生: {' → '.join(str(int(p)) for p in profile)}")
+    lines.append(f"先生: {' → '.join(str(p) for p in teacher)}")
 
-        lines.append(f"📊 スコア: {score}/100\n")
+    if result["improvements"]:
+        lines.append("【改善ポイント】")
+        for icon, text in result["improvements"]:
+            lines.append(f"{icon} {text}")
 
-        good = [f for f in a["feedback"] if f["type"] == "good"]
-        for f in good:
-            lines.append(f"✨ {f['msg']}")
-
-        problems = [f for f in a["feedback"] if f["type"] in ("critical", "warning")]
-        if problems:
-            lines.append("\n【改善ポイント】")
-            for f in problems:
-                icon = "🔴" if f["type"] == "critical" else "🟡"
-                lines.append(f"{icon} {f['area']}: {f['msg']}")
-
-        # 정착 관점 추가
-        if any(f["area"] in ("圧/深さ過多", "ムラ/不均一", "点の間隔が詰まりすぎ") for f in problems):
-            lines.append("\n💡 定着の観点：現在の状態だと圧が均一でないため、定着後にまだらに残る可能性があります。均一な密度と明暗で施術すれば定着後80%以上きれいに残ります！")
-
-        lines.append("")
-
-    if lang == "ja":
-        lines.append("引き続き練習を頑張ってください！☺️")
-    else:
-        lines.append("계속 연습 화이팅! ☺️")
+    lines.append("引き続き練習を頑張ってください！")
+    lines.append("何かご不明な点がございましたら、お気軽にご質問ください☺️")
 
     return "\n".join(lines)
 
@@ -430,8 +374,6 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
         result = analyze_image(sys.argv[1])
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        print("\n--- LINE Message ---")
-        print(format_line_message(result, "ja"))
+        print(format_line_message(result))
     else:
         print("Usage: python image_analyzer.py <image_path>")
