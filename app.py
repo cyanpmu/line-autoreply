@@ -1,7 +1,8 @@
 """
-파우더브로우 LINE 자동답장 서버 v5
-- 1:1 채팅: Q&A 매칭 + Claude API 폴백 + 이미지 분석
-- 그룹 채팅: 양방향 자동 번역 + 이미지 분석
+파우더브로우 LINE 자동답장 서버 v6
+- 1:1: 사진+이름/패턴 큐잉 (순서 무관, 10분 타임아웃)
+- 1:1: Q&A 매칭 + Claude 폴백
+- 그룹: 양방향 번역 + 이미지 분석
 """
 
 import os
@@ -26,6 +27,17 @@ IGNORE_NAMES = set(filter(None, os.environ.get("IGNORE_NAMES", "").split(",")))
 response_cache = {}
 CACHE_TTL = 3600
 
+# 유저별 임시 저장소 (사진/텍스트 큐잉)
+# {user_id: {"photo": bytes, "name": str, "pattern": str, "time": float}}
+pending_submissions = {}
+PENDING_TTL = 600  # 10분
+
+VALID_PATTERNS = {"SOFT", "NATURAL", "MIX", "ソフト", "ナチュラル", "ミックス"}
+
+
+# ═══════════════════════════════════════
+# LINE API
+# ═══════════════════════════════════════
 
 def verify_signature(body, signature):
     hash_val = hmac.new(LINE_CHANNEL_SECRET.encode(), body, hashlib.sha256).digest()
@@ -39,6 +51,16 @@ def reply_message(reply_token, messages):
             json={"replyToken": reply_token, "messages": messages[:5]}, timeout=30)
     except Exception as e:
         print(f"Reply error: {e}")
+
+
+def push_message(user_id, messages):
+    """reply_token 없이 보내기 (비동기 응답용)"""
+    try:
+        httpx.post("https://api.line.me/v2/bot/message/push",
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"},
+            json={"to": user_id, "messages": messages[:5]}, timeout=30)
+    except Exception as e:
+        print(f"Push error: {e}")
 
 
 def get_line_image(message_id):
@@ -74,6 +96,10 @@ def get_group_member_name(group_id, user_id):
     return ""
 
 
+# ═══════════════════════════════════════
+# 언어 감지 + 번역
+# ═══════════════════════════════════════
+
 def detect_language(text):
     korean = len(re.findall(r'[\uac00-\ud7af\u3131-\u3163\u1100-\u11ff]', text))
     japanese = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', text))
@@ -106,6 +132,153 @@ def translate_text(text, from_lang, to_lang):
     return None
 
 
+# ═══════════════════════════════════════
+# 유연한 텍스트 파싱
+# ═══════════════════════════════════════
+
+def parse_submission_text(text):
+    """
+    유연하게 파싱. 있는 정보만 추출. 없으면 None.
+
+    "田中・SOFT" → {pattern: "SOFT", name: "田中"}
+    "ソフト 3回目 眉頭むずい" → {pattern: "SOFT", practice: 3, difficulty: "眉頭むずい"}
+    "こんにちは" → {pattern: None} (제출이 아닌 일반 질문)
+    """
+    info = {
+        "name": None,
+        "pattern": None,
+        "technique": None,
+        "layering": None,
+        "needle": None,
+        "practice": None,
+        "difficulty": None,
+        "improvement": None,
+    }
+
+    t = text.strip()
+
+    # 패턴 (필수 — 이게 없으면 제출이 아님)
+    pattern_map = {
+        "SOFT": "SOFT", "ソフト": "SOFT", "そふと": "SOFT",
+        "NATURAL": "NATURAL", "ナチュラル": "NATURAL",
+        "MIX": "MIX", "ミックス": "MIX", "ミクス": "MIX",
+    }
+    for key, val in pattern_map.items():
+        if key.upper() in t.upper() or key in t:
+            info["pattern"] = val
+            break
+
+    if not info["pattern"]:
+        return info  # 패턴 없으면 제출 아님
+
+    # 기법
+    if re.search(r'テボリ|手彫り|てぼり|hand', t, re.IGNORECASE):
+        info["technique"] = "テボリ"
+    elif re.search(r'マシン|マシーン|machine', t, re.IGNORECASE):
+        info["technique"] = "マシン"
+
+    # 레이어링 횟수: "3回" "レイヤリング5回" 등
+    m = re.search(r'レイヤリング\s*(\d+)\s*回|(\d+)\s*回\s*レイヤ|(\d+)\s*回レイヤ', t)
+    if m:
+        info["layering"] = int(m.group(1) or m.group(2) or m.group(3))
+    else:
+        # "レイヤリング回数：3回" or just "3回" near context
+        m = re.search(r'回数[：:]\s*(\d+)', t)
+        if m:
+            info["layering"] = int(m.group(1))
+
+    # 니들: "3RL" "19P" "5RS" 등
+    needles = re.findall(r'\d+(?:RL|RS|P)\b', t, re.IGNORECASE)
+    if needles:
+        info["needle"] = " + ".join(needles)
+
+    # 연습 횟수: "2回目" "練習3回目"
+    m = re.search(r'練習\s*(\d+)\s*回目|(\d+)\s*回目', t)
+    if m:
+        info["practice"] = int(m.group(1) or m.group(2))
+
+    # 이름: "名前：田中" or "名前:田中"
+    m = re.search(r'名前[：:]\s*(.+?)(?:\n|$|技法|パターン|レイヤ)', t)
+    if m:
+        info["name"] = m.group(1).strip()
+    else:
+        # 【課題提出】없이 "田中・SOFT" 형태
+        for key in pattern_map:
+            if key.upper() in t.upper() or key in t:
+                before = re.split(re.escape(key), t, flags=re.IGNORECASE)[0]
+                before = re.sub(r'[・/\-\s【】課題提出]+', ' ', before).strip()
+                if before and len(before) <= 20:
+                    info["name"] = before
+                break
+
+    # 어려운 점
+    m = re.search(r'難しかった点[：:]\s*(.+?)(?:\n|改善|$)', t, re.DOTALL)
+    if m:
+        info["difficulty"] = m.group(1).strip()
+    else:
+        m = re.search(r'(?:難し|むずかし|できな|苦手).*?(?:$|\n)', t)
+        if m:
+            info["difficulty"] = m.group(0).strip()
+
+    # 개선된 점
+    m = re.search(r'改善できた点[：:]\s*(.+?)(?:\n|$)', t, re.DOTALL)
+    if m:
+        info["improvement"] = m.group(1).strip()
+    else:
+        m = re.search(r'(?:改善|よくなった|できるようになった).*?(?:$|\n)', t)
+        if m:
+            info["improvement"] = m.group(0).strip()
+
+    return info
+
+
+def clean_pending(user_id):
+    """만료된 pending 제거"""
+    if user_id in pending_submissions:
+        if time.time() - pending_submissions[user_id]["time"] > PENDING_TTL:
+            del pending_submissions[user_id]
+
+
+def try_analyze(user_id, reply_token=None):
+    """사진 + 패턴 둘 다 있으면 분석 실행. 추가 컨텍스트도 전달."""
+    if user_id not in pending_submissions:
+        return False
+
+    p = pending_submissions[user_id]
+    has_photo = p.get("photo") is not None
+    has_pattern = p.get("pattern") is not None
+
+    if not (has_photo and has_pattern):
+        return False
+
+    # 분석 실행
+    result = analyze_image_bytes(p["photo"])
+
+    if "error" in result:
+        msg = result["error"]
+    else:
+        # 학생 컨텍스트 전달
+        context = {
+            "name": p.get("name"),
+            "pattern": p.get("pattern"),
+            "technique": p.get("technique"),
+            "layering": p.get("layering"),
+            "needle": p.get("needle"),
+            "practice": p.get("practice"),
+            "difficulty": p.get("difficulty"),
+            "improvement": p.get("improvement"),
+        }
+        msg = format_line_message(result, context)
+
+    push_message(user_id, [{"type": "text", "text": msg}])
+    del pending_submissions[user_id]
+    return True
+
+
+# ═══════════════════════════════════════
+# 웹훅
+# ═══════════════════════════════════════
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     body = request.get_data()
@@ -131,7 +304,7 @@ def webhook():
                 handle_group_image(reply_token, msg)
         elif source_type == "user":
             if msg["type"] == "image":
-                handle_image(reply_token, msg)
+                handle_image(reply_token, user_id, msg)
             elif msg["type"] == "text":
                 if detect_language(msg["text"]) == "ko":
                     continue
@@ -140,13 +313,16 @@ def webhook():
     return "OK"
 
 
+# ═══════════════════════════════════════
+# 그룹
+# ═══════════════════════════════════════
+
 def handle_group_text(reply_token, group_id, user_id, text):
     if len(text.strip()) < 3:
         return
     sender_name = get_group_member_name(group_id, user_id)
     is_staff = sender_name in IGNORE_NAMES
     lang = detect_language(text)
-
     if lang == "ko":
         translated = translate_text(text, "ko", "ja")
         if translated:
@@ -172,23 +348,76 @@ def handle_group_image(reply_token, msg):
     ])
 
 
-def handle_image(reply_token, msg):
+# ═══════════════════════════════════════
+# 1:1: 큐잉 시스템
+# ═══════════════════════════════════════
+
+def handle_image(reply_token, user_id, msg):
+    """사진 수신 → 큐에 저장"""
     image_bytes = get_line_image(msg["id"])
     if not image_bytes:
         reply_message(reply_token, [{"type": "text", "text": "画像の取得に失敗しました。もう一度送ってください🙏"}])
         return
-    result = analyze_image_bytes(image_bytes)
-    if "error" in result:
-        reply_message(reply_token, [{"type": "text", "text": result["error"]}])
+
+    clean_pending(user_id)
+
+    # 이미 패턴이 저장되어 있으면 → 바로 분석
+    if user_id in pending_submissions and pending_submissions[user_id].get("pattern"):
+        pending_submissions[user_id]["photo"] = image_bytes
+        pending_submissions[user_id]["time"] = time.time()
+        reply_message(reply_token, [{"type": "text", "text": "📸 写真を受け取りました！分析中です...少々お待ちください☺️"}])
+        try_analyze(user_id)
         return
-    reply_message(reply_token, [{"type": "text", "text": format_line_message(result)}])
+
+    # 패턴 없으면 → 사진만 저장하고 질문
+    pending_submissions[user_id] = {
+        "photo": image_bytes,
+        "time": time.time(),
+    }
+    reply_message(reply_token, [{
+        "type": "text",
+        "text": "📸 写真を受け取りました！\n\nお名前とパターン名を教えてください☺️\n（例：田中・SOFT）\n（例：NATURAL 3回目）"
+    }])
 
 
 def handle_text(reply_token, user_id, text):
+    # ID 확인 커맨드
     if text.strip().lower() in ("myid", "id"):
         reply_message(reply_token, [{"type": "text", "text": f"あなたのUser ID:\n{user_id}"}])
         return
 
+    # 만료된 pending 정리
+    clean_pending(user_id)
+
+    # 제출 텍스트인지 파싱
+    info = parse_submission_text(text)
+
+    if info["pattern"]:
+        # 패턴 감지됨 → 제출로 처리
+        if user_id not in pending_submissions:
+            pending_submissions[user_id] = {"time": time.time()}
+
+        # 파싱된 정보 모두 저장 (None이 아닌 것만)
+        for key, val in info.items():
+            if val is not None:
+                pending_submissions[user_id][key] = val
+        pending_submissions[user_id]["time"] = time.time()
+
+        # 사진이 이미 있으면 → 바로 분석
+        if pending_submissions[user_id].get("photo"):
+            reply_message(reply_token, [{"type": "text", "text": f"✅ {info['pattern']}で分析します。少々お待ちください☺️"}])
+            try_analyze(user_id)
+            return
+
+        # 사진 없으면 → 사진 요청
+        name_msg = f"{info['name']}さん、" if info.get("name") else ""
+        reply_message(reply_token, [{
+            "type": "text",
+            "text": f"{name_msg}✅ {info['pattern']}パターンですね！\n課題の写真を送ってください📸"
+        }])
+        return
+
+    # 일반 Q&A 처리
     cache_key = hashlib.md5(text.encode()).hexdigest()
     if cache_key in response_cache:
         cached = response_cache[cache_key]
