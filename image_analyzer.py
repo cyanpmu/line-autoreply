@@ -35,8 +35,9 @@ PATTERN_REFS = {
 
 
 def detect_brows(image):
-    """눈썹 영역 감지 — 오감지 방지 강화"""
+    """눈썹 영역 감지 — 가장 큰 1개만 반환, 오감지 철저 방지"""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     blurred = cv2.GaussianBlur(gray, (7, 7), 0)
     h, w = gray.shape
 
@@ -50,43 +51,55 @@ def detect_brows(image):
 
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    brows = []
+    candidates = []
     img_area = h * w
-    min_area = img_area * 0.008
-    max_area = img_area * 0.35
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < min_area or area > max_area:
+        # 너무 작거나 너무 큰 것 제외
+        if area < img_area * 0.01 or area > img_area * 0.30:
             continue
 
         x, y, bw, bh = cv2.boundingRect(cnt)
         aspect = bw / bh if bh > 0 else 0
 
-        # 눈썹 형태 필터: 가로가 세로보다 2~7배 길어야 함
-        if aspect < 2.0 or aspect > 7.0:
+        # 눈썹 형태: 가로 2.5~6배
+        if aspect < 2.5 or aspect > 6.0:
             continue
 
-        # 이미지 가장자리 (상단 10%, 하단 15%) 제외 — 커팅매트/텍스트
-        if y < h * 0.10 or (y + bh) > h * 0.85:
+        # 이미지 상단 20% 제외 (커팅매트/자)
+        if y < h * 0.20:
             continue
 
-        # 너무 작은 높이 제외
+        # 이미지 하단 20% 제외 (텍스트/이름)
+        if (y + bh) > h * 0.80:
+            continue
+
+        # 높이가 이미지의 5% 미만 제외
         if bh < h * 0.05:
             continue
 
-        brows.append({"contour": cnt, "bbox": (x, y, bw, bh), "area": area})
+        # 초록색 영역 제외 (커팅매트)
+        roi_hsv = hsv[y:y+bh, x:x+bw]
+        mask_roi = np.zeros((bh, bw), dtype=np.uint8)
+        shifted = cnt.copy()
+        shifted[:, 0, 0] -= x
+        shifted[:, 0, 1] -= y
+        cv2.drawContours(mask_roi, [shifted], -1, 255, -1)
+        hue_pixels = roi_hsv[:, :, 0][mask_roi > 0]
+        if len(hue_pixels) > 0:
+            green_ratio = np.sum((hue_pixels > 35) & (hue_pixels < 85)) / len(hue_pixels)
+            if green_ratio > 0.3:
+                continue
 
-    # 면적 기준 상위 1~3개만 (가장 큰 것이 진짜 눈썹)
-    brows.sort(key=lambda b: b["area"], reverse=True)
+        candidates.append({"contour": cnt, "bbox": (x, y, bw, bh), "area": area})
 
-    # 가장 큰 눈썹 대비 30% 미만인 것은 제외
-    if brows:
-        max_area_found = brows[0]["area"]
-        brows = [b for b in brows if b["area"] > max_area_found * 0.3]
+    if not candidates:
+        return []
 
-    brows.sort(key=lambda b: b["bbox"][0])
-    return brows[:3]  # 최대 3개
+    # 면적이 가장 큰 1개만 반환
+    candidates.sort(key=lambda b: b["area"], reverse=True)
+    return [candidates[0]]
 
 
 def analyze_zones(gray, brow, num_zones=5):
