@@ -1,8 +1,9 @@
 """
-파우더브로우 LINE 자동답장 서버 v6
+파우더브로우 LINE 자동답장 서버 v6.1
 - 1:1: 사진+이름/패턴 큐잉 (순서 무관, 10분 타임아웃)
 - 1:1: Q&A 매칭 + Claude 폴백
 - 그룹: 양방향 번역 + 이미지 분석
+- v6.1: 유저 지정 패턴을 채점에 반영, 모델명 업데이트
 """
 
 import os
@@ -28,15 +29,14 @@ response_cache = {}
 CACHE_TTL = 3600
 
 # 유저별 임시 저장소 (사진/텍스트 큐잉)
-# {user_id: {photo, name, pattern, technique, layering, needle, practice, difficulty, improvement, time}}
 pending_submissions = {}
 PENDING_TTL = 600  # 10분
 
 # ────────────────────────────────────────────
 # 모델명 설정 (중앙 관리)
 # ────────────────────────────────────────────
-MODEL_SMART = "claude-sonnet-4-5"          # Q&A 폴백, 메인 응답
-MODEL_FAST  = "claude-haiku-4-5-20251001"  # 번역 (짧은 텍스트, 저렴)
+MODEL_SMART = "claude-sonnet-4-6"            # Q&A 폴백, 메인 응답
+MODEL_FAST  = "claude-haiku-4-5-20251001"    # 번역 (짧은 텍스트, 저렴)
 
 
 # ═══════════════════════════════════════
@@ -144,7 +144,7 @@ def translate_text(text, from_lang, to_lang):
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
             json={
-                "model": MODEL_FAST,   # 번역은 Haiku (빠르고 저렴)
+                "model": MODEL_FAST,
                 "max_tokens": 400,
                 "messages": [{"role": "user", "content": f"{instruction}\n\n{text}"}],
             },
@@ -267,7 +267,8 @@ def try_analyze(user_id):
     if not (p.get("photo") and p.get("pattern")):
         return False
 
-    result = analyze_image_bytes(p["photo"])
+    # ★ v6.1: 유저 지정 패턴을 analyze에 전달
+    result = analyze_image_bytes(p["photo"], pattern=p.get("pattern"))
 
     if "error" in result:
         msg = result["error"]
