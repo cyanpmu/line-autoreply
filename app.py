@@ -14,15 +14,13 @@ import re
 import httpx
 from flask import Flask, request, abort
 from qa_engine import find_best_qa_match, get_system_prompt
-from image_analyzer import analyze_image
+from image_analyzer import analyze_image_bytes, format_line_message
 
 app = Flask(__name__)
 
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
-
-# 무시할 사람 닉네임 (선생님, 보조쌤)
 IGNORE_NAMES = set(filter(None, os.environ.get("IGNORE_NAMES", "").split(",")))
 
 response_cache = {}
@@ -30,7 +28,7 @@ CACHE_TTL = 3600
 
 
 # ═══════════════════════════════════════
-# LINE API
+# LINE API 유틸
 # ═══════════════════════════════════════
 
 def verify_signature(body, signature):
@@ -39,19 +37,24 @@ def verify_signature(body, signature):
 
 
 def reply_message(reply_token, messages):
-    url = "https://api.line.me/v2/bot/message/reply"
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
     try:
-        httpx.post(url, headers=headers, json={"replyToken": reply_token, "messages": messages[:5]}, timeout=30)
+        httpx.post(
+            "https://api.line.me/v2/bot/message/reply",
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"},
+            json={"replyToken": reply_token, "messages": messages[:5]},
+            timeout=30,
+        )
     except Exception as e:
         print(f"Reply error: {e}")
 
 
 def get_line_image(message_id):
-    url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
     try:
-        resp = httpx.get(url, headers=headers, timeout=30)
+        resp = httpx.get(
+            f"https://api-data.line.me/v2/bot/message/{message_id}/content",
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            timeout=30,
+        )
         if resp.status_code == 200:
             return resp.content
     except Exception as e:
@@ -60,10 +63,12 @@ def get_line_image(message_id):
 
 
 def get_user_name(user_id):
-    url = f"https://api.line.me/v2/bot/profile/{user_id}"
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
     try:
-        resp = httpx.get(url, headers=headers, timeout=10)
+        resp = httpx.get(
+            f"https://api.line.me/v2/bot/profile/{user_id}",
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            timeout=10,
+        )
         if resp.status_code == 200:
             return resp.json().get("displayName", "")
     except:
@@ -72,10 +77,12 @@ def get_user_name(user_id):
 
 
 def get_group_member_name(group_id, user_id):
-    url = f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}/profile"
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
     try:
-        resp = httpx.get(url, headers=headers, timeout=10)
+        resp = httpx.get(
+            f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}/profile",
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            timeout=10,
+        )
         if resp.status_code == 200:
             return resp.json().get("displayName", "")
     except:
@@ -101,11 +108,12 @@ def translate_text(text, from_lang, to_lang):
     if not CLAUDE_API_KEY:
         return None
 
-    if from_lang == "ko" and to_lang == "ja":
-        instruction = "韓国語を自然な日本語に翻訳。パウダーブロウ専門用語はそのまま。翻訳だけ出力。"
-    elif from_lang == "ja" and to_lang == "ko":
-        instruction = "日本語を自然な韓国語に翻訳。パウダーブロウ専門用語はそのまま。翻訳だけ出力。"
-    else:
+    instructions = {
+        ("ko", "ja"): "韓国語を自然な日本語に翻訳。パウダーブロウ専門用語はそのまま。翻訳だけ出力。",
+        ("ja", "ko"): "日本語を自然な韓国語に翻訳。パウダーブロウ専門用語はそのまま。翻訳だけ出力。",
+    }
+    instruction = instructions.get((from_lang, to_lang))
+    if not instruction:
         return None
 
     try:
@@ -144,7 +152,6 @@ def webhook():
         source_type = event["source"]["type"]
         msg = event["message"]
 
-        # ── 그룹/룸 → 번역 + 이미지 분석 ──
         if source_type in ("group", "room"):
             group_id = event["source"].get("groupId") or event["source"].get("roomId", "")
             if msg["type"] == "text":
@@ -152,10 +159,9 @@ def webhook():
             elif msg["type"] == "image":
                 handle_group_image(reply_token, group_id, user_id, msg)
 
-        # ── 1:1 → 일본어만 응답 ──
         elif source_type == "user":
             if msg["type"] == "image":
-                handle_image(reply_token, user_id, msg)
+                handle_image(reply_token, msg)
             elif msg["type"] == "text":
                 if detect_language(msg["text"]) == "ko":
                     continue
@@ -165,7 +171,7 @@ def webhook():
 
 
 # ═══════════════════════════════════════
-# 그룹: 자동 번역
+# 그룹: 자동 번역 + 이미지 분석
 # ═══════════════════════════════════════
 
 def handle_group_text(reply_token, group_id, user_id, text):
@@ -191,77 +197,40 @@ def handle_group_image(reply_token, group_id, user_id, msg):
     if not image_bytes:
         return
 
-    # 이미지를 임시 파일로 저장 후 분석
-    tmp_path = f"/tmp/brow_{msg['id']}.jpg"
-    with open(tmp_path, "wb") as f:
-        f.write(image_bytes)
-
-    result = analyze_image(tmp_path)
-
-    # 임시 파일 삭제
-    try:
-        os.remove(tmp_path)
-    except:
-        pass
-
+    result = analyze_image_bytes(image_bytes)
     if "error" in result:
         return
 
-    # 첫 번째 눈썹 결과로 메시지 생성
-    if result.get("results"):
-        first = result["results"][0]
-        score = first["analysis"]["score"]
-        feedback = first["analysis"]["feedback"]
+    if not result.get("results"):
+        return
 
-        # 일본어 피드백 조합
-        lines = [f"📊 スコア: {score}/100\n"]
+    # 일본어 피드백
+    ja_msg = format_line_message(result, "ja")
+    messages = [{"type": "text", "text": ja_msg}]
 
-        good = [f for f in feedback if f["type"] == "good"]
-        for f in good:
-            lines.append(f"✨ {f['msg']}")
+    # 선생님용 한국어 요약
+    first = result["results"][0]
+    score = first["analysis"]["score"]
+    prob_areas = [f["area"] for f in first["analysis"]["feedback"] if f["type"] in ("critical", "warning")]
+    ko = f"🇰🇷 [분석] {score}점"
+    if prob_areas:
+        ko += f" | {', '.join(prob_areas[:5])}"
+    messages.append({"type": "text", "text": ko})
 
-        problems = [f for f in feedback if f["type"] in ("critical", "warning")]
-        if problems:
-            lines.append("\n【改善ポイント】")
-            for f in problems:
-                icon = "🔴" if f["type"] == "critical" else "🟡"
-                lines.append(f"{icon} {f['area']}: {f['msg']}")
-
-        lines.append("\n引き続き練習を頑張ってください！☺️")
-        ja_msg = "\n".join(lines)
-
-        messages = [{"type": "text", "text": ja_msg}]
-
-        # 선생님용 한국어 요약
-        prob_names = [f["area"] for f in problems]
-        ko = f"🇰🇷 [분석] {score}점"
-        if prob_names:
-            ko += f" | {', '.join(prob_names[:5])}"
-        messages.append({"type": "text", "text": ko})
-
-        reply_message(reply_token, messages)
+    reply_message(reply_token, messages)
 
 
 # ═══════════════════════════════════════
 # 1:1: Q&A + 이미지
 # ═══════════════════════════════════════
 
-def handle_image(reply_token, user_id, msg):
+def handle_image(reply_token, msg):
     image_bytes = get_line_image(msg["id"])
     if not image_bytes:
         reply_message(reply_token, [{"type": "text", "text": "画像の取得に失敗しました。もう一度送ってください🙏"}])
         return
 
-    tmp_path = f"/tmp/brow_{msg['id']}.jpg"
-    with open(tmp_path, "wb") as f:
-        f.write(image_bytes)
-
-    result = analyze_image(tmp_path)
-
-    try:
-        os.remove(tmp_path)
-    except:
-        pass
+    result = analyze_image_bytes(image_bytes)
 
     if "error" in result:
         reply_message(reply_token, [{"type": "text", "text": result["error"]}])
@@ -271,14 +240,12 @@ def handle_image(reply_token, user_id, msg):
         reply_message(reply_token, [{"type": "text", "text": "眉毛を検出できませんでした。もう少し鮮明な写真で再度お送りください🙏"}])
         return
 
-    # format_line_message 사용
-    from image_analyzer import format_line_message
     ja_msg = format_line_message(result, "ja")
     reply_message(reply_token, [{"type": "text", "text": ja_msg}])
 
 
 def handle_text(reply_token, user_id, text):
-    if text.strip().lower() in ("myid", "id", "内アイディ"):
+    if text.strip().lower() in ("myid", "id"):
         reply_message(reply_token, [{"type": "text", "text": f"あなたのUser ID:\n{user_id}"}])
         return
 
@@ -292,7 +259,6 @@ def handle_text(reply_token, user_id, text):
     user_name = get_user_name(user_id)
     name_prefix = f"{user_name}さん、" if user_name else ""
 
-    # Q&A 매칭
     matched = find_best_qa_match(text)
     if matched:
         resp = name_prefix + matched
@@ -300,7 +266,6 @@ def handle_text(reply_token, user_id, text):
         reply_message(reply_token, [{"type": "text", "text": resp}])
         return
 
-    # Claude 폴백
     if CLAUDE_API_KEY:
         claude_resp = call_claude(text)
         if claude_resp:
