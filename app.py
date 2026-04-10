@@ -12,11 +12,13 @@ import base64
 import time
 import re
 import httpx
+
+# 파일 상단에 추가
+from qa_engine import get_system_prompt
 from flask import Flask, request, abort
 
 from image_analyzer import analyze_student_brow
-# 파일 상단에 추가
-from qa_engine import get_system_prompt
+
 
 # call_claude() 함수 안에서 system 파라미터 교체
 "system": get_system_prompt(),
