@@ -294,7 +294,7 @@ def call_claude(text):
             headers={"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
             json={
                 "model": "claude-sonnet-4-20250514", "max_tokens": 500,
-                "system": "あなたはパウダーブロウ（半永久眉毛）の専門講師です。11歳でも理解できる親切な日本語で答えてください。授業で使う用語：眉頭、眉上（オレンジゾーン）、眉尾、レイヤリング、グラデーション、デザインライン、ブレンディング。",
+                "system": get_system_prompt(),
                 "messages": [{"role": "user", "content": text}],
             },
             timeout=25,
