@@ -28,11 +28,15 @@ response_cache = {}
 CACHE_TTL = 3600
 
 # 유저별 임시 저장소 (사진/텍스트 큐잉)
-# {user_id: {"photo": bytes, "name": str, "pattern": str, "time": float}}
+# {user_id: {photo, name, pattern, technique, layering, needle, practice, difficulty, improvement, time}}
 pending_submissions = {}
 PENDING_TTL = 600  # 10분
 
-VALID_PATTERNS = {"SOFT", "NATURAL", "MIX", "ソフト", "ナチュラル", "ミックス"}
+# ────────────────────────────────────────────
+# 모델명 설정 (중앙 관리)
+# ────────────────────────────────────────────
+MODEL_SMART = "claude-sonnet-4-5"          # Q&A 폴백, 메인 응답
+MODEL_FAST  = "claude-haiku-4-5-20251001"  # 번역 (짧은 텍스트, 저렴)
 
 
 # ═══════════════════════════════════════
@@ -46,9 +50,12 @@ def verify_signature(body, signature):
 
 def reply_message(reply_token, messages):
     try:
-        httpx.post("https://api.line.me/v2/bot/message/reply",
+        httpx.post(
+            "https://api.line.me/v2/bot/message/reply",
             headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"},
-            json={"replyToken": reply_token, "messages": messages[:5]}, timeout=30)
+            json={"replyToken": reply_token, "messages": messages[:5]},
+            timeout=30,
+        )
     except Exception as e:
         print(f"Reply error: {e}")
 
@@ -56,17 +63,23 @@ def reply_message(reply_token, messages):
 def push_message(user_id, messages):
     """reply_token 없이 보내기 (비동기 응답용)"""
     try:
-        httpx.post("https://api.line.me/v2/bot/message/push",
+        httpx.post(
+            "https://api.line.me/v2/bot/message/push",
             headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"},
-            json={"to": user_id, "messages": messages[:5]}, timeout=30)
+            json={"to": user_id, "messages": messages[:5]},
+            timeout=30,
+        )
     except Exception as e:
         print(f"Push error: {e}")
 
 
 def get_line_image(message_id):
     try:
-        resp = httpx.get(f"https://api-data.line.me/v2/bot/message/{message_id}/content",
-            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}, timeout=30)
+        resp = httpx.get(
+            f"https://api-data.line.me/v2/bot/message/{message_id}/content",
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            timeout=30,
+        )
         if resp.status_code == 200:
             return resp.content
     except Exception as e:
@@ -76,22 +89,28 @@ def get_line_image(message_id):
 
 def get_user_name(user_id):
     try:
-        resp = httpx.get(f"https://api.line.me/v2/bot/profile/{user_id}",
-            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}, timeout=10)
+        resp = httpx.get(
+            f"https://api.line.me/v2/bot/profile/{user_id}",
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            timeout=10,
+        )
         if resp.status_code == 200:
             return resp.json().get("displayName", "")
-    except:
+    except Exception:
         pass
     return ""
 
 
 def get_group_member_name(group_id, user_id):
     try:
-        resp = httpx.get(f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}/profile",
-            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}, timeout=10)
+        resp = httpx.get(
+            f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}/profile",
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            timeout=10,
+        )
         if resp.status_code == 200:
             return resp.json().get("displayName", "")
-    except:
+    except Exception:
         pass
     return ""
 
@@ -101,7 +120,7 @@ def get_group_member_name(group_id, user_id):
 # ═══════════════════════════════════════
 
 def detect_language(text):
-    korean = len(re.findall(r'[\uac00-\ud7af\u3131-\u3163\u1100-\u11ff]', text))
+    korean  = len(re.findall(r'[\uac00-\ud7af\u3131-\u3163\u1100-\u11ff]', text))
     japanese = len(re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', text))
     if korean > 0 and korean >= japanese:
         return "ko"
@@ -121,12 +140,20 @@ def translate_text(text, from_lang, to_lang):
     if not instruction:
         return None
     try:
-        resp = httpx.post("https://api.anthropic.com/v1/messages",
+        resp = httpx.post(
+            "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 500,
-                  "messages": [{"role": "user", "content": f"{instruction}\n\n{text}"}]}, timeout=20)
+            json={
+                "model": MODEL_FAST,   # 번역은 Haiku (빠르고 저렴)
+                "max_tokens": 400,
+                "messages": [{"role": "user", "content": f"{instruction}\n\n{text}"}],
+            },
+            timeout=20,
+        )
         if resp.status_code == 200:
             return resp.json()["content"][0]["text"]
+        else:
+            print(f"Translate API error: {resp.status_code} {resp.text[:200]}")
     except Exception as e:
         print(f"Translate error: {e}")
     return None
@@ -139,25 +166,19 @@ def translate_text(text, from_lang, to_lang):
 def parse_submission_text(text):
     """
     유연하게 파싱. 있는 정보만 추출. 없으면 None.
-
     "田中・SOFT" → {pattern: "SOFT", name: "田中"}
     "ソフト 3回目 眉頭むずい" → {pattern: "SOFT", practice: 3, difficulty: "眉頭むずい"}
-    "こんにちは" → {pattern: None} (제출이 아닌 일반 질문)
+    "こんにちは" → {pattern: None} (일반 질문)
     """
     info = {
-        "name": None,
-        "pattern": None,
-        "technique": None,
-        "layering": None,
-        "needle": None,
-        "practice": None,
-        "difficulty": None,
-        "improvement": None,
+        "name": None, "pattern": None, "technique": None,
+        "layering": None, "needle": None, "practice": None,
+        "difficulty": None, "improvement": None,
     }
 
     t = text.strip()
 
-    # 패턴 (필수 — 이게 없으면 제출이 아님)
+    # 패턴 (없으면 제출 아님)
     pattern_map = {
         "SOFT": "SOFT", "ソフト": "SOFT", "そふと": "SOFT",
         "NATURAL": "NATURAL", "ナチュラル": "NATURAL",
@@ -169,7 +190,7 @@ def parse_submission_text(text):
             break
 
     if not info["pattern"]:
-        return info  # 패턴 없으면 제출 아님
+        return info
 
     # 기법
     if re.search(r'テボリ|手彫り|てぼり|hand', t, re.IGNORECASE):
@@ -177,32 +198,30 @@ def parse_submission_text(text):
     elif re.search(r'マシン|マシーン|machine', t, re.IGNORECASE):
         info["technique"] = "マシン"
 
-    # 레이어링 횟수: "3回" "レイヤリング5回" 등
+    # 레이어링 횟수
     m = re.search(r'レイヤリング\s*(\d+)\s*回|(\d+)\s*回\s*レイヤ|(\d+)\s*回レイヤ', t)
     if m:
         info["layering"] = int(m.group(1) or m.group(2) or m.group(3))
     else:
-        # "レイヤリング回数：3回" or just "3回" near context
         m = re.search(r'回数[：:]\s*(\d+)', t)
         if m:
             info["layering"] = int(m.group(1))
 
-    # 니들: "3RL" "19P" "5RS" 등
+    # 니들
     needles = re.findall(r'\d+(?:RL|RS|P)\b', t, re.IGNORECASE)
     if needles:
         info["needle"] = " + ".join(needles)
 
-    # 연습 횟수: "2回目" "練習3回目"
+    # 연습 횟수
     m = re.search(r'練習\s*(\d+)\s*回目|(\d+)\s*回目', t)
     if m:
         info["practice"] = int(m.group(1) or m.group(2))
 
-    # 이름: "名前：田中" or "名前:田中"
+    # 이름
     m = re.search(r'名前[：:]\s*(.+?)(?:\n|$|技法|パターン|レイヤ)', t)
     if m:
         info["name"] = m.group(1).strip()
     else:
-        # 【課題提出】없이 "田中・SOFT" 형태
         for key in pattern_map:
             if key.upper() in t.upper() or key in t:
                 before = re.split(re.escape(key), t, flags=re.IGNORECASE)[0]
@@ -235,37 +254,32 @@ def parse_submission_text(text):
 def clean_pending(user_id):
     """만료된 pending 제거"""
     if user_id in pending_submissions:
-        if time.time() - pending_submissions[user_id]["time"] > PENDING_TTL:
+        if time.time() - pending_submissions[user_id].get("time", 0) > PENDING_TTL:
             del pending_submissions[user_id]
 
 
-def try_analyze(user_id, reply_token=None):
-    """사진 + 패턴 둘 다 있으면 분석 실행. 추가 컨텍스트도 전달."""
+def try_analyze(user_id):
+    """사진 + 패턴 둘 다 있으면 분석 실행"""
     if user_id not in pending_submissions:
         return False
 
     p = pending_submissions[user_id]
-    has_photo = p.get("photo") is not None
-    has_pattern = p.get("pattern") is not None
-
-    if not (has_photo and has_pattern):
+    if not (p.get("photo") and p.get("pattern")):
         return False
 
-    # 분석 실행
     result = analyze_image_bytes(p["photo"])
 
     if "error" in result:
         msg = result["error"]
     else:
-        # 학생 컨텍스트 전달
         context = {
-            "name": p.get("name"),
-            "pattern": p.get("pattern"),
-            "technique": p.get("technique"),
-            "layering": p.get("layering"),
-            "needle": p.get("needle"),
-            "practice": p.get("practice"),
-            "difficulty": p.get("difficulty"),
+            "name":        p.get("name"),
+            "pattern":     p.get("pattern"),
+            "technique":   p.get("technique"),
+            "layering":    p.get("layering"),
+            "needle":      p.get("needle"),
+            "practice":    p.get("practice"),
+            "difficulty":  p.get("difficulty"),
             "improvement": p.get("improvement"),
         }
         msg = format_line_message(result, context)
@@ -286,12 +300,16 @@ def webhook():
     if LINE_CHANNEL_SECRET and not verify_signature(body, signature):
         abort(403)
 
-    data = json.loads(body)
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        abort(400)
+
     for event in data.get("events", []):
-        if event["type"] != "message":
+        if event.get("type") != "message":
             continue
 
-        reply_token = event["replyToken"]
+        reply_token = event.get("replyToken", "")
         user_id = event["source"].get("userId", "")
         source_type = event["source"]["type"]
         msg = event["message"]
@@ -307,7 +325,7 @@ def webhook():
                 handle_image(reply_token, user_id, msg)
             elif msg["type"] == "text":
                 if detect_language(msg["text"]) == "ko":
-                    continue
+                    continue  # 한국어(선생님) 무시
                 handle_text(reply_token, user_id, msg["text"])
 
     return "OK"
@@ -323,6 +341,7 @@ def handle_group_text(reply_token, group_id, user_id, text):
     sender_name = get_group_member_name(group_id, user_id)
     is_staff = sender_name in IGNORE_NAMES
     lang = detect_language(text)
+
     if lang == "ko":
         translated = translate_text(text, "ko", "ja")
         if translated:
@@ -341,7 +360,8 @@ def handle_group_image(reply_token, msg):
     if "error" in result:
         return
     ja_msg = format_line_message(result)
-    ko_summary = f"🇰🇷 [분석] {result['score']}점"
+    score = result["results"][0]["score"] if result.get("results") else "?"
+    ko_summary = f"🇰🇷 [분석] {score}점"
     reply_message(reply_token, [
         {"type": "text", "text": ja_msg},
         {"type": "text", "text": ko_summary},
@@ -376,7 +396,7 @@ def handle_image(reply_token, user_id, msg):
     }
     reply_message(reply_token, [{
         "type": "text",
-        "text": "📸 写真を受け取りました！\n\nお名前とパターン名を教えてください☺️\n（例：田中・SOFT）\n（例：NATURAL 3回目）"
+        "text": "📸 写真を受け取りました！\n\nお名前とパターン名を教えてください☺️\n（例：田中・SOFT）\n（例：NATURAL 3回目）",
     }])
 
 
@@ -386,7 +406,6 @@ def handle_text(reply_token, user_id, text):
         reply_message(reply_token, [{"type": "text", "text": f"あなたのUser ID:\n{user_id}"}])
         return
 
-    # 만료된 pending 정리
     clean_pending(user_id)
 
     # 제출 텍스트인지 파싱
@@ -397,7 +416,6 @@ def handle_text(reply_token, user_id, text):
         if user_id not in pending_submissions:
             pending_submissions[user_id] = {"time": time.time()}
 
-        # 파싱된 정보 모두 저장 (None이 아닌 것만)
         for key, val in info.items():
             if val is not None:
                 pending_submissions[user_id][key] = val
@@ -409,15 +427,15 @@ def handle_text(reply_token, user_id, text):
             try_analyze(user_id)
             return
 
-        # 사진 없으면 → 사진 요청
+        # 사진 없으면 → 요청
         name_msg = f"{info['name']}さん、" if info.get("name") else ""
         reply_message(reply_token, [{
             "type": "text",
-            "text": f"{name_msg}✅ {info['pattern']}パターンですね！\n課題の写真を送ってください📸"
+            "text": f"{name_msg}✅ {info['pattern']}パターンですね！\n課題の写真を送ってください📸",
         }])
         return
 
-    # 일반 Q&A 처리
+    # 일반 Q&A
     cache_key = hashlib.md5(text.encode()).hexdigest()
     if cache_key in response_cache:
         cached = response_cache[cache_key]
@@ -448,13 +466,21 @@ def handle_text(reply_token, user_id, text):
 
 def call_claude(text):
     try:
-        resp = httpx.post("https://api.anthropic.com/v1/messages",
+        resp = httpx.post(
+            "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 500,
-                  "system": get_system_prompt(),
-                  "messages": [{"role": "user", "content": text}]}, timeout=25)
+            json={
+                "model": MODEL_SMART,
+                "max_tokens": 500,
+                "system": get_system_prompt(),
+                "messages": [{"role": "user", "content": text}],
+            },
+            timeout=25,
+        )
         if resp.status_code == 200:
             return resp.json()["content"][0]["text"]
+        else:
+            print(f"Claude API error: {resp.status_code} {resp.text[:200]}")
     except Exception as e:
         print(f"Claude error: {e}")
     return None
